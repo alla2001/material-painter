@@ -431,6 +431,7 @@ pub struct PainterApp {
     other_brush: Brush,
     /// Second color, traded with the brush color by the swap button (S).
     color2: [f32; 3],
+    color_sliders: ColorSliders,
     cam: OrbitCam,
     cam2d: Cam2d,
     layout: Layout,
@@ -989,6 +990,58 @@ fn color_button(ui: &mut egui::Ui, c: &mut [f32; 3], tip: Option<&str>) -> bool 
     changed
 }
 
+/// What the color sliders remember between frames.
+#[derive(Default)]
+struct ColorSliders {
+    /// Hue, saturation and brightness (0..1). Kept apart from the color
+    /// because gray has no hue and black no saturation.
+    hsv: [f32; 3],
+    /// The color the sliders last set. A different brush color means it
+    /// changed elsewhere (swap, tray, picker) and the sliders start over from it.
+    out: [f32; 3],
+    /// Temperature slider position (-100..100) and the color it shifts from.
+    temp: f32,
+    base: [f32; 3],
+    shifting: bool,
+}
+
+/// sRGB (0..1) to hue, saturation and brightness (0..1 each).
+fn rgb_to_hsv(c: [f32; 3]) -> [f32; 3] {
+    let max = c[0].max(c[1]).max(c[2]);
+    let d = max - c[0].min(c[1]).min(c[2]);
+    let h = if d <= 0.0 {
+        0.0
+    } else if max == c[0] {
+        ((c[1] - c[2]) / d).rem_euclid(6.0)
+    } else if max == c[1] {
+        (c[2] - c[0]) / d + 2.0
+    } else {
+        (c[0] - c[1]) / d + 4.0
+    };
+    [h / 6.0, if max > 0.0 { d / max } else { 0.0 }, max]
+}
+
+fn hsv_to_rgb([h, s, v]: [f32; 3]) -> [f32; 3] {
+    let channel = |n: f32| {
+        let k = (n + h * 6.0) % 6.0;
+        v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    [channel(5.0), channel(3.0), channel(1.0)]
+}
+
+/// The hue, saturation and brightness of `c`, keeping what `prev` had where
+/// `c` can't say it: gray has no hue and black no saturation.
+fn hsv_keeping(prev: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    let n = rgb_to_hsv(c);
+    [if n[1] > 0.0 && n[2] > 0.0 { n[0] } else { prev[0] }, if n[2] > 0.0 { n[1] } else { prev[1] }, n[2]]
+}
+
+/// Warms (`t` toward 1: more red, less blue) or cools (toward -1) a color.
+fn shift_temperature(c: [f32; 3], t: f32) -> [f32; 3] {
+    let gain = [1.0 + 0.30 * t, 1.0 + 0.05 * t, 1.0 - 0.30 * t];
+    std::array::from_fn(|i| (c[i] * gain[i]).clamp(0.0, 1.0))
+}
+
 /// Trades the active brush for the other tool's, keeping what Paint and
 /// Eraser share (see `PainterApp::set_tool`).
 fn swap_brushes(active: &mut Brush, other: &mut Brush) {
@@ -1436,6 +1489,7 @@ impl PainterApp {
             brush: Brush::default(),
             other_brush: Brush::default(),
             color2: [0.95, 0.95, 0.95],
+            color_sliders: ColorSliders::default(),
             cam: OrbitCam::default(),
             cam2d: Cam2d::default(),
             layout: Layout::Split,
@@ -2409,18 +2463,16 @@ impl PainterApp {
             // The right-hand controls go first; the tool controls get what's
             // left and clip instead of running under them on narrow windows.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let rt_btn = ui
-                    .add(theme::selectable(self.rt.enabled, theme::with_icon(icons::SUN, "Ray trace")))
-                    .on_hover_text("Path-traced preview of the 3D view (F10). Right-click for settings.");
-                if rt_btn.clicked() {
-                    self.rt.enabled = !self.rt.enabled;
+                // The ray traced preview has no button here: it's still on F10
+                // and in the View menu.
+                if self.tool != Tool::Eraser && self.target == StrokeTarget::Content {
+                    let color_btn = ui
+                        .add(theme::selectable(false, theme::with_icon(icons::DROP, "Color")))
+                        .on_hover_text("Hue, saturation, brightness and temperature, the brush's height, roughness and metallic values, and your saved colors");
+                    egui::Popup::from_toggle_button_response(&color_btn)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| self.color_hud(ui));
                 }
-                rt_btn.context_menu(|ui| {
-                    ui.set_min_width(220.0);
-                    labeled(ui, "Max samples", |ui| ui.add(egui::Slider::new(&mut self.rt.max_samples, 16..=4096).logarithmic(true)));
-                    labeled(ui, "Bounces", |ui| ui.add(egui::Slider::new(&mut self.rt.bounces, 1..=12)));
-                    ui.checkbox(&mut self.rt.ground, "Ground plane with shadows");
-                });
                 if ui
                     .add(theme::selectable(self.view.show_wire, theme::with_icon(icons::GRID_FOUR, "UV wire")))
                     .on_hover_text("Show the UV wireframe in the 2D view")
@@ -2635,6 +2687,70 @@ impl PainterApp {
             }
             color_button(ui, &mut self.color2, Some("Second color"));
         });
+    }
+
+    /// The panel behind the toolbar's Color button: both colors, hue,
+    /// saturation, brightness and temperature, the brush's material values
+    /// and the swatch tray.
+    fn color_hud(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(280.0);
+        self.color_slots(ui);
+        ui.add_space(4.0);
+
+        let mut st = std::mem::take(&mut self.color_sliders);
+        let mut color = self.brush.mat.color;
+        if st.out != color {
+            st.hsv = hsv_keeping(st.hsv, color);
+            st.temp = 0.0;
+            st.shifting = false;
+        }
+        let hsv_slider = |ui: &mut egui::Ui, label: &str, v: &mut f32, max: f32, unit: &str| {
+            labeled(ui, label, |ui| ui.add(egui::Slider::new(v, 0.0..=max).max_decimals(0).suffix(unit)).changed())
+        };
+        let (mut h, mut s, mut v) = (st.hsv[0] * 360.0, st.hsv[1] * 100.0, st.hsv[2] * 100.0);
+        let mut edited = hsv_slider(ui, "Hue", &mut h, 360.0, "°");
+        edited |= hsv_slider(ui, "Saturation", &mut s, 100.0, "%");
+        edited |= hsv_slider(ui, "Brightness", &mut v, 100.0, "%");
+        if edited {
+            st.hsv = [h / 360.0, s / 100.0, v / 100.0];
+            color = hsv_to_rgb(st.hsv);
+        }
+        // Relative: it pushes the color warmer or cooler from where the drag
+        // began and springs back to 0 on release, so it can push further.
+        let temp = labeled(ui, "Temperature", |ui| ui.add(egui::Slider::new(&mut st.temp, -100.0..=100.0).max_decimals(0)));
+        if temp.changed() {
+            if !st.shifting {
+                st.base = color;
+                st.shifting = true;
+            }
+            color = shift_temperature(st.base, st.temp / 100.0);
+            st.hsv = hsv_keeping(st.hsv, color);
+        }
+        if temp.drag_stopped() || temp.lost_focus() {
+            st.temp = 0.0;
+            st.shifting = false;
+        }
+        self.brush.mat.color = color;
+        st.out = color;
+        self.color_sliders = st;
+
+        ui.separator();
+        let m = &mut self.brush.mat;
+        channel_toggles(ui, &mut m.enabled);
+        if m.enabled[3] {
+            slider(ui, "Height", &mut m.height, -1.0..=1.0);
+        }
+        if m.enabled[1] {
+            slider(ui, "Roughness", &mut m.rough, 0.0..=1.0);
+        }
+        if m.enabled[2] {
+            slider(ui, "Metallic", &mut m.metal, 0.0..=1.0);
+        }
+        if m.enabled[4] {
+            slider(ui, "Opacity", &mut m.opacity, 0.0..=1.0);
+        }
+        ui.separator();
+        self.swatch_tray(ui);
     }
 
     /// Saved colors. Click one for the brush color, Shift+click for the second
@@ -5858,5 +5974,39 @@ mod brush_tests {
         assert_eq!(active.mat.enabled, MatValues::default().enabled);
         assert_eq!((other.size, other.flow), (20.0, 0.2));
         assert_eq!(other.mat.enabled, color_only);
+    }
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    #[test]
+    fn hsv_round_trips() {
+        for c in [[0.8, 0.2, 0.1], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.2, 0.9, 0.4], [0.1, 0.3, 0.95], [0.5, 0.5, 0.5], [1.0, 0.0, 0.0]] {
+            assert!(close(hsv_to_rgb(rgb_to_hsv(c)), c), "{c:?}");
+        }
+        assert!(close(rgb_to_hsv([1.0, 0.0, 0.0]), [0.0, 1.0, 1.0]));
+        assert!(close(rgb_to_hsv([0.0, 1.0, 0.0]), [1.0 / 3.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn gray_and_black_keep_the_old_hue_and_saturation() {
+        let prev = [0.6, 0.7, 0.8];
+        assert_eq!(hsv_keeping(prev, [0.4, 0.4, 0.4]), [0.6, 0.0, 0.4]);
+        assert_eq!(hsv_keeping(prev, [0.0, 0.0, 0.0]), [0.6, 0.7, 0.0]);
+        assert!(close(hsv_keeping(prev, [0.0, 0.0, 1.0]), [2.0 / 3.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn temperature_warms_and_cools() {
+        let c = [0.5, 0.5, 0.5];
+        assert_eq!(shift_temperature(c, 0.0), c);
+        let warm = shift_temperature(c, 1.0);
+        assert!(warm[0] > c[0] && warm[2] < c[2]);
+        let cool = shift_temperature(c, -1.0);
+        assert!(cool[0] < c[0] && cool[2] > c[2]);
+        // Never leaves the 0..1 range.
+        assert!(shift_temperature([1.0, 1.0, 1.0], 1.0).iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(shift_temperature([0.0, 0.0, 0.0], -1.0).iter().all(|v| (0.0..=1.0).contains(v)));
     }
 }
