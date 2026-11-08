@@ -426,6 +426,11 @@ pub struct PainterApp {
     target: StrokeTarget,
     tool: Tool,
     brush: Brush,
+    /// The brush of the tool that isn't active: Paint and Eraser each keep
+    /// their own (see `set_tool`).
+    other_brush: Brush,
+    /// Second color, traded with the brush color by the swap button (S).
+    color2: [f32; 3],
     cam: OrbitCam,
     cam2d: Cam2d,
     layout: Layout,
@@ -967,12 +972,47 @@ fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInc
 }
 
 fn color_edit(ui: &mut egui::Ui, c: &mut [f32; 3]) -> bool {
+    color_button(ui, c, None)
+}
+
+/// A color button (sRGB, 0..1) that opens the picker, with an optional tooltip.
+fn color_button(ui: &mut egui::Ui, c: &mut [f32; 3], tip: Option<&str>) -> bool {
     let mut rgb = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
-    let changed = ui.color_edit_button_srgb(&mut rgb).changed();
+    let resp = ui.color_edit_button_srgb(&mut rgb);
+    let changed = resp.changed();
+    if let Some(tip) = tip {
+        resp.on_hover_text(tip);
+    }
     if changed {
         *c = rgb.map(|v| v as f32 / 255.0);
     }
     changed
+}
+
+/// Trades the active brush for the other tool's, keeping what Paint and
+/// Eraser share (see `PainterApp::set_tool`).
+fn swap_brushes(active: &mut Brush, other: &mut Brush) {
+    std::mem::swap(active, other);
+    // `other` now holds the brush just left.
+    let left = &*other;
+    active.mat = MatValues { enabled: active.mat.enabled, ..left.mat };
+    active.mask_value = left.mask_value;
+    active.fix_value = left.fix_value;
+    active.symmetry = left.symmetry;
+    active.projection = left.projection;
+    active.paint_through = left.paint_through;
+    active.angle_limit = left.angle_limit;
+    active.stabilize = left.stabilize;
+}
+
+/// Two arrows trading places: the button between the two brush colors.
+fn swap_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::click());
+    let stroke = egui::Stroke::new(1.5, if resp.hovered() { Color32::WHITE } else { theme::TEXT });
+    let c = rect.center();
+    ui.painter().arrow(c + vec2(5.0, -3.5), vec2(-10.0, 0.0), stroke);
+    ui.painter().arrow(c + vec2(-5.0, 3.5), vec2(10.0, 0.0), stroke);
+    resp
 }
 
 /// Channel toggles in Substance order: color, height, rough, metal, opacity.
@@ -1269,7 +1309,7 @@ impl PainterApp {
         let at = self.engine.layers.len();
         self.selected = self.engine.add_paint_layer(at, None, Some("Stitches".into()), &mut self.undo);
         self.target = StrokeTarget::Content;
-        self.tool = Tool::Path;
+        self.set_tool(Tool::Path);
         self.brush.tip = crate::brushes::BRUSH_ALPHAS.iter().position(|b| b.name == "Stitch");
         self.brush.size = 34.0;
         self.brush.spacing = 1.25;
@@ -1394,6 +1434,8 @@ impl PainterApp {
             target: StrokeTarget::Content,
             tool: Tool::Paint,
             brush: Brush::default(),
+            other_brush: Brush::default(),
+            color2: [0.95, 0.95, 0.95],
             cam: OrbitCam::default(),
             cam2d: Cam2d::default(),
             layout: Layout::Split,
@@ -1827,7 +1869,7 @@ impl PainterApp {
                 Action::SetBrushTip(tip) => {
                     self.brush.tip = tip;
                     if !matches!(self.tool, Tool::Paint | Tool::Eraser) {
-                        self.tool = Tool::Paint;
+                        self.set_tool(Tool::Paint);
                     }
                     let name = tip.map_or("Round", |i| crate::brushes::BRUSH_ALPHAS[i].name);
                     self.status = format!("Brush tip: {name}.");
@@ -2095,10 +2137,10 @@ impl PainterApp {
                 return;
             }
             if i.key_pressed(Key::Num1) {
-                self.tool = Tool::Paint;
+                self.set_tool(Tool::Paint);
             }
             if i.key_pressed(Key::Num2) {
-                self.tool = Tool::Eraser;
+                self.set_tool(Tool::Eraser);
             }
             if i.key_pressed(Key::OpenBracket) {
                 self.brush.size = (self.brush.size / 1.15).max(2.0);
@@ -2107,13 +2149,16 @@ impl PainterApp {
                 self.brush.size = (self.brush.size * 1.15).min(800.0);
             }
             if i.key_pressed(Key::I) {
-                self.tool = Tool::Picker;
+                self.set_tool(Tool::Picker);
             }
             if i.key_pressed(Key::Num3) || i.key_pressed(Key::P) {
-                self.tool = Tool::PolyFill;
+                self.set_tool(Tool::PolyFill);
             }
             if i.key_pressed(Key::Num4) || i.key_pressed(Key::L) {
-                self.tool = Tool::Path;
+                self.set_tool(Tool::Path);
+            }
+            if i.key_pressed(Key::S) {
+                self.swap_colors();
             }
             if i.key_pressed(Key::W) {
                 self.view.show_wire_3d = !self.view.show_wire_3d;
@@ -2532,6 +2577,10 @@ impl PainterApp {
                         ui.add_space(6.0);
                         resp
                     };
+                    if self.tool != Tool::Eraser && self.target == StrokeTarget::Content {
+                        self.color_slots(ui);
+                        ui.separator();
+                    }
                     s(ui, "Size", &mut self.brush.size, 2.0..=800.0, false)
                         .on_hover_text("Brush size ([ and ] to shrink / grow, Ctrl+right-drag in the view)");
                     s(ui, "Flow", &mut self.brush.flow, 0.01..=1.0, true);
@@ -2558,6 +2607,86 @@ impl PainterApp {
         });
     }
 
+    /// Switches tool. Paint and Eraser each keep their own brush (size,
+    /// hardness, flow, opacity, spacing, tip, jitter, grain, pressure and the
+    /// channels they touch), so a strong brush and a light eraser can live
+    /// side by side. The color and material values, how strokes reach the
+    /// surface (projection, symmetry, angle limit, stabilizer) and the mask and
+    /// bake-fix values stay shared. Every other tool paints with the Paint brush.
+    fn set_tool(&mut self, tool: Tool) {
+        if (self.tool == Tool::Eraser) != (tool == Tool::Eraser) {
+            swap_brushes(&mut self.brush, &mut self.other_brush);
+        }
+        self.tool = tool;
+    }
+
+    fn swap_colors(&mut self) {
+        std::mem::swap(&mut self.brush.mat.color, &mut self.color2);
+    }
+
+    /// The brush color and a second one, with a button (and the S key) to
+    /// trade them.
+    fn color_slots(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            color_button(ui, &mut self.brush.mat.color, Some("Brush color"));
+            if swap_button(ui).on_hover_text("Swap the two colors (S)").clicked() {
+                self.swap_colors();
+            }
+            color_button(ui, &mut self.color2, Some("Second color"));
+        });
+    }
+
+    /// Saved colors. Click one for the brush color, Shift+click for the second
+    /// color, right-click to remove it. Kept in the preferences, so they
+    /// follow you between projects.
+    fn swatch_tray(&mut self, ui: &mut egui::Ui) {
+        let current = self.brush.mat.color.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+        let shift = ui.input(|i| i.modifiers.shift);
+        let (mut pick, mut remove, mut add) = (None, None, false);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
+            for (i, c) in self.prefs.swatches.iter().enumerate() {
+                let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), egui::Sense::click());
+                let on = *c == current;
+                ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(c[0], c[1], c[2]));
+                let edge = egui::Stroke::new(if on { 2.0 } else { 1.0 }, if on { Color32::WHITE } else { Color32::from_gray(80) });
+                ui.painter().rect_stroke(rect, 2.0, edge, egui::StrokeKind::Inside);
+                let tip = format!("#{:02x}{:02x}{:02x}\nClick: brush color\nShift+click: second color\nRight-click: remove", c[0], c[1], c[2]);
+                let resp = resp.on_hover_text(tip);
+                if resp.clicked() {
+                    pick = Some((i, shift));
+                }
+                if resp.secondary_clicked() {
+                    remove = Some(i);
+                }
+            }
+            let room = self.prefs.swatches.len() < prefs::MAX_SWATCHES && !self.prefs.swatches.contains(&current);
+            let plus = egui::Button::new(icons::PLUS).min_size(vec2(18.0, 18.0));
+            if ui.add_enabled(room, plus).on_hover_text("Save the brush color in the tray").clicked() {
+                add = true;
+            }
+        });
+        if self.prefs.swatches.is_empty() {
+            ui.label(egui::RichText::new("Press + to keep the brush color here.").small().color(theme::TEXT_DIM));
+        }
+        let rgb = |c: [u8; 3]| c.map(|v| v as f32 / 255.0);
+        if let Some((i, second)) = pick {
+            let c = rgb(self.prefs.swatches[i]);
+            if second {
+                self.color2 = c;
+            } else {
+                self.brush.mat.color = c;
+            }
+        }
+        if let Some(i) = remove {
+            self.prefs.swatches.remove(i);
+        }
+        if add {
+            self.prefs.swatches.push(current);
+        }
+    }
+
     fn tool_strip(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.spacing_mut().item_spacing.y = 4.0;
@@ -2569,7 +2698,7 @@ impl PainterApp {
             (Tool::Picker, icons::EYEDROPPER, "Pick material from the surface (I)"),
         ] {
             if theme::icon_button(ui, icon, self.tool == tool, 34.0).on_hover_text(tip).clicked() {
-                self.tool = tool;
+                self.set_tool(tool);
             }
         }
         ui.add_space(4.0);
@@ -3262,7 +3391,7 @@ impl PainterApp {
                                     } else {
                                         self.target = StrokeTarget::BakeFix(i);
                                         self.view.mode = ViewMode::Map(i);
-                                        self.tool = Tool::Paint;
+                                        self.set_tool(Tool::Paint);
                                     }
                                 }
                                 if has_fix && ui.small_button("✖").on_hover_text("Clear painted fixes").clicked() {
@@ -4097,6 +4226,11 @@ impl PainterApp {
     }
 
     fn brush_properties(&mut self, ui: &mut egui::Ui, content: bool) {
+        if content && self.tool != Tool::Eraser {
+            section(ui, "Color");
+            self.color_slots(ui);
+            self.swatch_tray(ui);
+        }
         section(ui, if self.tool == Tool::Eraser { "Eraser" } else { "Brush" });
         slider(ui, "Size", &mut self.brush.size, 2.0..=800.0);
         slider(ui, "Hardness", &mut self.brush.hardness, 0.0..=0.99);
@@ -4453,7 +4587,7 @@ impl PainterApp {
                                                 emission: self.brush.mat.emission,
                                                 ..f.mat
                                             };
-                                            self.tool = Tool::Paint;
+                                            self.set_tool(Tool::Paint);
                                             ui.close();
                                         }
                                     });
@@ -5024,7 +5158,7 @@ impl PainterApp {
         self.brush.mat.color = color;
         self.brush.mat.rough = rough;
         self.brush.mat.metal = metal;
-        self.tool = Tool::Paint;
+        self.set_tool(Tool::Paint);
         let hex = color.map(|c| (c * 255.0).round() as u8);
         self.status = format!(
             "Picked #{:02X}{:02X}{:02X}, roughness {:.2}, metallic {:.2}.",
@@ -5557,6 +5691,7 @@ impl PainterApp {
                     ("Ctrl+PageUp / PageDown", "Switch workspace"),
                     ("1 / 2 / I", "Paint / Eraser / Pick material"),
                     ("X", "Toggle X symmetry"),
+                    ("S", "Swap the brush color and the second color"),
                     ("F", "Frame mesh"),
                     ("M / C", "Material view / cycle channels"),
                     ("F1 / F2 / F3", "3D+2D / 3D / 2D"),
@@ -5686,5 +5821,42 @@ impl eframe::App for PainterApp {
         }
         let ms = start.elapsed().as_secs_f32() * 1000.0;
         self.frame_ms = self.frame_ms * 0.9 + ms * 0.1;
+    }
+}
+
+#[cfg(test)]
+mod brush_tests {
+    use super::*;
+
+    #[test]
+    fn eraser_keeps_its_own_brush() {
+        let mut active = Brush::default();
+        let mut other = Brush::default();
+        active.size = 200.0;
+        active.flow = 1.0;
+        active.mat.color = [0.1, 0.2, 0.3];
+        active.symmetry = 1;
+        active.projection = BrushProjection::Surface;
+        other.size = 20.0;
+        other.flow = 0.2;
+        let mut color_only = [false; crate::engine::CHANNELS];
+        color_only[0] = true;
+        other.mat.enabled = color_only;
+
+        // To the eraser: its own size, flow and channels; the color and how
+        // strokes reach the surface carry over.
+        swap_brushes(&mut active, &mut other);
+        assert_eq!((active.size, active.flow), (20.0, 0.2));
+        assert_eq!(active.mat.enabled, color_only);
+        assert_eq!(active.mat.color, [0.1, 0.2, 0.3]);
+        assert_eq!(active.symmetry, 1);
+        assert_eq!(active.projection, BrushProjection::Surface);
+
+        // Back to paint: its settings are exactly as left, channels included.
+        swap_brushes(&mut active, &mut other);
+        assert_eq!((active.size, active.flow), (200.0, 1.0));
+        assert_eq!(active.mat.enabled, MatValues::default().enabled);
+        assert_eq!((other.size, other.flow), (20.0, 0.2));
+        assert_eq!(other.mat.enabled, color_only);
     }
 }
