@@ -2689,6 +2689,87 @@ impl PainterApp {
         });
     }
 
+/// Interactive saturation/value field and hue strip used inside Claude's
+/// Color HUD. The surrounding HUD (two colors, temperature, channel sliders
+/// and saved swatches) remains intact.
+fn color_field(ui: &mut egui::Ui, hsv: &mut [f32; 3]) -> bool {
+    let mut changed = false;
+    let hue_color = hsv_to_rgb([hsv[0], 1.0, 1.0]);
+    let (field, response) = ui.allocate_exact_size(vec2(ui.available_width(), 116.0), egui::Sense::click_and_drag());
+    let painter = ui.painter();
+
+    painter.rect_filled(field, 2.0, Color32::from_rgb(
+        (hue_color[0] * 255.0) as u8,
+        (hue_color[1] * 255.0) as u8,
+        (hue_color[2] * 255.0) as u8,
+    ));
+    let mut white = egui::epaint::Mesh::default();
+    let base = white.vertices.len() as u32;
+    white.colored_vertex(field.left_top(), Color32::WHITE);
+    white.colored_vertex(field.right_top(), Color32::from_rgba_unmultiplied(255, 255, 255, 0));
+    white.colored_vertex(field.right_bottom(), Color32::from_rgba_unmultiplied(255, 255, 255, 0));
+    white.colored_vertex(field.left_bottom(), Color32::WHITE);
+    white.add_triangle(base, base + 1, base + 2);
+    white.add_triangle(base, base + 2, base + 3);
+    painter.add(egui::Shape::mesh(white));
+
+    let mut black = egui::epaint::Mesh::default();
+    let base = black.vertices.len() as u32;
+    black.colored_vertex(field.left_top(), Color32::from_black_alpha(0));
+    black.colored_vertex(field.right_top(), Color32::from_black_alpha(0));
+    black.colored_vertex(field.right_bottom(), Color32::from_black_alpha(245));
+    black.colored_vertex(field.left_bottom(), Color32::from_black_alpha(245));
+    black.add_triangle(base, base + 1, base + 2);
+    black.add_triangle(base, base + 2, base + 3);
+    painter.add(egui::Shape::mesh(black));
+    painter.rect_stroke(field, 2.0, egui::Stroke::new(1.0, theme::OUTLINE), egui::StrokeKind::Inside);
+
+    let marker = egui::pos2(
+        field.left() + hsv[1] * field.width(),
+        field.bottom() - hsv[2] * field.height(),
+    );
+    painter.circle_stroke(marker, 6.0, egui::Stroke::new(2.0, Color32::BLACK));
+    painter.circle_stroke(marker, 4.5, egui::Stroke::new(1.5, Color32::WHITE));
+    if (response.clicked() || response.dragged()) && let Some(pos) = response.interact_pointer_pos() {
+        hsv[1] = ((pos.x - field.left()) / field.width()).clamp(0.0, 1.0);
+        hsv[2] = (1.0 - (pos.y - field.top()) / field.height()).clamp(0.0, 1.0);
+        changed = true;
+    }
+
+    let (hue_rect, hue_response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 13.0), egui::Sense::click_and_drag());
+    let mut spectrum = egui::epaint::Mesh::default();
+    const STEPS: usize = 48;
+    for i in 0..STEPS {
+        let h0 = i as f32 / STEPS as f32;
+        let h1 = (i + 1) as f32 / STEPS as f32;
+        let color = |h: f32| {
+            let c = hsv_to_rgb([h, 1.0, 1.0]);
+            Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)
+        };
+        let a = color(h0);
+        let b = color(h1);
+        let base = spectrum.vertices.len() as u32;
+        spectrum.colored_vertex(egui::pos2(hue_rect.left() + hue_rect.width() * h0, hue_rect.top()), a);
+        spectrum.colored_vertex(egui::pos2(hue_rect.left() + hue_rect.width() * h1, hue_rect.top()), b);
+        spectrum.colored_vertex(egui::pos2(hue_rect.left() + hue_rect.width() * h1, hue_rect.bottom()), b);
+        spectrum.colored_vertex(egui::pos2(hue_rect.left() + hue_rect.width() * h0, hue_rect.bottom()), a);
+        spectrum.add_triangle(base, base + 1, base + 2);
+        spectrum.add_triangle(base, base + 2, base + 3);
+    }
+    ui.painter().add(egui::Shape::mesh(spectrum));
+    let hx = hue_rect.left() + hsv[0] * hue_rect.width();
+    ui.painter().line_segment(
+        [egui::pos2(hx, hue_rect.top() - 2.0), egui::pos2(hx, hue_rect.bottom() + 2.0)],
+        egui::Stroke::new(2.0, Color32::WHITE),
+    );
+    if (hue_response.clicked() || hue_response.dragged()) && let Some(pos) = hue_response.interact_pointer_pos() {
+        hsv[0] = ((pos.x - hue_rect.left()) / hue_rect.width()).clamp(0.0, 1.0);
+        changed = true;
+    }
+    changed
+}
+
     /// The panel behind the toolbar's Color button: both colors, hue,
     /// saturation, brightness and temperature, the brush's material values
     /// and the swatch tray.
@@ -2707,8 +2788,10 @@ impl PainterApp {
         let hsv_slider = |ui: &mut egui::Ui, label: &str, v: &mut f32, max: f32, unit: &str| {
             labeled(ui, label, |ui| ui.add(egui::Slider::new(v, 0.0..=max).max_decimals(0).suffix(unit)).changed())
         };
+        ui.label(egui::RichText::new("COLOR FIELD").small().color(theme::TEXT_DIM));
+        let mut edited = color_field(ui, &mut st.hsv);
         let (mut h, mut s, mut v) = (st.hsv[0] * 360.0, st.hsv[1] * 100.0, st.hsv[2] * 100.0);
-        let mut edited = hsv_slider(ui, "Hue", &mut h, 360.0, "°");
+        edited |= hsv_slider(ui, "Hue", &mut h, 360.0, "°");
         edited |= hsv_slider(ui, "Saturation", &mut s, 100.0, "%");
         edited |= hsv_slider(ui, "Brightness", &mut v, 100.0, "%");
         if edited {
