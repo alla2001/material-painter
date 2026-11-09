@@ -2465,7 +2465,7 @@ impl PainterApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // The ray traced preview has no button here: it's still on F10
                 // and in the View menu.
-                if self.tool != Tool::Eraser && self.target == StrokeTarget::Content {
+                if matches!(self.tool, Tool::Paint | Tool::Picker) && self.target == StrokeTarget::Content {
                     let color_btn = ui
                         .add(theme::selectable(false, theme::with_icon(icons::DROP, "Color")))
                         .on_hover_text("Hue, saturation, brightness and temperature, the brush's height, roughness and metallic values, and your saved colors");
