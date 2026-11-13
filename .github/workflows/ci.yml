@@ -45,4 +45,4 @@ jobs:
       - name: GPU tests (Metal)
         if: runner.os == 'macOS'
         continue-on-error: true
-        run: cargo test --locked --bin material_painter -- --ignored --test-threads 1 --skip perf_4k --skip ui_screenshots --skip timing --skip unwrap_speed --skip update::
+        run: cargo test --locked --bin material_painter -- --ignored --test-threads 1 --skip perf_4k --skip ui_screenshots --skip timing --skip unwrap_speed --skip "update::"
