@@ -6,7 +6,7 @@ struct ApplyU {
     color: vec4<f32>,   // sRGB-encoded rgb, opacity
     rmh: vec4<f32>,     // roughness, metallic, height, mask value
     ch: vec4<f32>,      // channel enabled flags: color, roughness, metallic, height
-    p: vec4<f32>,       // stroke opacity, erase, opacity channel enabled, unused
+    p: vec4<f32>,       // stroke opacity, erase, opacity channel enabled, masks: over the smart mask
     g: vec4<f32>,       // grain strength (0 off), tiling, in uv (else tri-planar world), invert
     e: vec4<f32>,       // sRGB-encoded emission, emission channel enabled
     s: vec4<f32>,       // specular level, specular channel enabled, normal channel enabled (paints flat), unused
@@ -124,11 +124,24 @@ fn fs_paint(in: FsOut) -> PaintOut {
     return out;
 }
 
+// Masks store (r) a multiplier of the layer's smart mask and (g) a value
+// added on top: the mask is r * smart mask + g. The app's brush sets r (the
+// smart mask shows where it is white) and clears g. Strokes "over" (Painter's
+// order, for imports) lay their value over the whole mask so far, smart mask
+// included: an affine step on both; erasing them brings back what was below
+// the paint (the smart mask, or the mask's starting value).
 @fragment
 fn fs_mask(in: FsOut) -> @location(0) vec4<f32> {
     let c = vec2<i32>(in.pos.xy);
     let m = textureLoad(stroke, c, 0).r * u.p.x * grain(c);
-    let base = textureLoad(b_color, c, 0).r;
-    let target_value = select(u.rmh.w, 0.0, u.p.y > 0.5);
-    return vec4<f32>(mix(base, target_value, m), 0.0, 0.0, 1.0);
+    let base = textureLoad(b_color, c, 0).rg;
+    let erase = u.p.y > 0.5;
+    if (u.p.w > 0.5) {
+        if (erase) {
+            return vec4<f32>(base.x + (1.0 - base.x) * m, base.y * (1.0 - m), 0.0, 1.0);
+        }
+        return vec4<f32>(base.x * (1.0 - m), base.y * (1.0 - m) + u.rmh.w * m, 0.0, 1.0);
+    }
+    let target_value = select(u.rmh.w, 0.0, erase);
+    return vec4<f32>(mix(base.x, target_value, m), base.y * (1.0 - m), 0.0, 1.0);
 }

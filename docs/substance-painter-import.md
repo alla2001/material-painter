@@ -13,13 +13,19 @@ what didn't.
 - **The final look** of each set's base color, roughness, metallic, height, opacity, emissive and normal: Painter's own
   result as of its last save, as one paint layer, *Painter result (flattened)*. This is the
   project exactly as it looked in Painter.
-- **Each set's layer stack structure**, rebuilt in a hidden folder, *Painter layers (rebuilt)*:
-  - folders and layers with their names, visibility and opacity;
-  - fills of flat values (color, roughness, metallic, height), exactly;
-  - masks: their starting value, Levels, and Painter's dirt, edge wear, curvature, ambient
-    occlusion, position and noise masks as the closest Material Painter smart masks
-    (approximately);
-  - blend modes Normal, Multiply and Subtract; Overlay-like modes approximately.
+- **Each set's layer stack**, rebuilt in a hidden folder, *Painter layers (rebuilt)*:
+  - folders and layers with their names, visibility, opacity and blend modes (Normal, Multiply
+    and Subtract exactly; Overlay-like modes approximately);
+  - fills of values and of **images** (the images stored in the project, with their placement:
+    tiling, rotation, offset; UV or tri-planar);
+  - **paint layers, from the brush strokes Painter recorded**: each stroke is replayed from its
+    own camera, with its size, spacing, flow and opacity, symmetry copies included;
+  - **masks, step by step in Painter's order**: their starting value, **painted strokes and
+    erasers**, **polygon fills** (clicks and rectangles, by triangle, polygon, object or UV
+    island), images, values, Levels and blurs, and Painter's dirt, edge wear, curvature, ambient
+    occlusion, position, light and noise masks as the closest Material Painter smart masks
+    (approximately). Strokes painted over a smart mask go over it, as in Painter;
+  - geometry masks (a layer on some of the model's objects only).
 
 To edit the structure instead of the flattened result, show *Painter layers (rebuilt)* and hide
 *Painter result (flattened)*.
@@ -28,11 +34,13 @@ To edit the structure instead of the flattened result, show *Painter layers (reb
 
 - **Procedural materials, generators and filters** (Substance `.sbsar` graphs): Material Painter
   has no Substance engine, so it can't run them. Their result is in the flattened layer; in the
-  rebuilt stack those layers are hidden, empty placeholders with their names.
-- **Brush strokes**: kept in the flattened layer, not as strokes you can edit. Paint layers come
-  in as named placeholders.
-- **Image fills**: not rebuilt (the image is in the flattened result).
-- **Painted mask strokes**: not rebuilt.
+  rebuilt stack, procedural material and filter layers are hidden, empty placeholders with their
+  names, and smart masks are the closest Material Painter ones.
+- **Brush tips**: Painter's brush tips are Substance graphs too, so strokes are replayed with
+  Material Painter's round brush (the procedural round tip keeps its hardness). Painter's brush
+  engine isn't copied exactly either: replayed strokes come close to Painter's, not texel for
+  texel.
+- **Anchor points and references** in masks, color selections and stencils: not rebuilt.
 - **Channels Material Painter doesn't have**: ambient occlusion and others. Painter's specular
   level isn't read yet.
 - **Baked mesh maps**: Material Painter bakes its own from the model when the project opens. If
@@ -56,4 +64,6 @@ Reading `.spp` files is adapted from [SubCraft](https://github.com/Aalzard/subcr
 and the SubCraft contributors (MIT License): its HDF5, model, document, texture-cache and
 JPEG 2000 readers and its synthetic test project, in [`src/spp`](../src/spp) with the license
 text. Material Painter adds the reading of Painter's older (version 0) document format and its
-own import into Material Painter's layers.
+own import into Material Painter's layers. How Painter's recorded strokes, polygon fills and
+image placements read (screen origin, brush size, rectangle selection) follows SubCraft's
+research notes (`docs/spp-research.md`), measured there on real projects.

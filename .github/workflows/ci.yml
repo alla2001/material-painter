@@ -29,9 +29,20 @@ jobs:
           RUSTFLAGS: -D warnings
       - name: Unit tests
         run: cargo test --locked
+      # The installer script compiles (its [Code] waits for the app when it updates
+      # itself); the release builds the real installer.
+      - name: Installer script
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          New-Item -ItemType Directory -Force "dist/Material Painter" | Out-Null
+          Copy-Item README.md "dist/Material Painter/"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q installer\material-painter.iss
+          if ($LASTEXITCODE -ne 0) { throw "the installer script doesn't compile" }
       # Experimental: the GPU tests on the macOS runner's Metal GPU, to catch
       # shader or limit problems specific to Apple GPUs.
       - name: GPU tests (Metal)
         if: runner.os == 'macOS'
         continue-on-error: true
-        run: cargo test --locked --bin material_painter -- --ignored --test-threads 1 --skip perf_4k --skip ui_screenshots --skip timing
+        run: cargo test --locked --bin material_painter -- --ignored --test-threads 1 --skip perf_4k --skip ui_screenshots --skip timing --skip unwrap_speed --skip update::

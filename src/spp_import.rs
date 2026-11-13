@@ -4,16 +4,15 @@
 //! there). What comes across:
 //! * the model, every mesh of it, with its UVs and normals;
 //! * every texture set (the meshes of one material), with its size and the final look of its
-//!   base color, roughness, metallic, height and opacity channels: Painter's flattened result as
-//!   of its last save, as one paint layer;
-//! * each set's layer stack structure, rebuilt as far as Material Painter has equivalents (see
-//!   `app::spp_open`), next to that flattened layer.
+//!   channels: Painter's flattened result as of its last save, as one paint layer;
+//! * each set's layer stack, rebuilt as far as Material Painter has equivalents (see
+//!   `app::spp_open` and `app::spp_replay`: recorded strokes and polygon fills are replayed),
+//!   with the images its fills use, decoded here.
 //!
 //! What does not, and is listed in the import report: procedural (Substance `.sbsar`)
 //! materials, filters and generators (Material Painter has no Substance engine, and never
-//! reads the contents of those archives: they are Adobe's), brush strokes, Painter's other
-//! channels (normal details, ambient occlusion) and its baked mesh maps
-//! (Material Painter bakes its own).
+//! reads the contents of those archives: they are Adobe's), Painter's other channels (ambient
+//! occlusion...) and its baked mesh maps (Material Painter bakes its own).
 
 use crate::mesh::Mesh;
 use crate::spp::{CacheFormat, LayerInfo, SppFile, channel_bits};
@@ -26,6 +25,18 @@ pub const MAX_RESOLUTION: u32 = 4096;
 /// A Painter channel as one of Material Painter's paint-layer channels: its size and texels in
 /// `engine::PAINT_FORMATS[channel]` layout.
 pub type ChannelData = (u32, Vec<u8>);
+
+/// An image a layer of the project uses (bitmap fills of content and masks), as Painter stored
+/// it: 8-bit RGBA, top row first, and the same as a PNG file for fill layers.
+pub struct ImportedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    pub png: std::sync::Arc<Vec<u8>>,
+}
+
+/// Largest edge of an imported layer image.
+const MAX_IMAGE: u32 = 2048;
 
 /// One texture set of an imported project.
 pub struct ImportedSet {
@@ -46,6 +57,12 @@ pub struct Imported {
     pub came: Vec<String>,
     /// What didn't, and why.
     pub left: Vec<String>,
+    /// Painter's world (where strokes and polygon fills were recorded) to the imported mesh's
+    /// normalized space, and that space's scale (mesh units per Painter unit).
+    pub to_mesh: glam::Mat4,
+    pub mesh_scale: f32,
+    /// The images the layer stacks use, by resource URL.
+    pub images: std::collections::HashMap<String, ImportedImage>,
 }
 
 /// Painter channel flag for each of Material Painter's channels.
@@ -107,6 +124,11 @@ pub fn import(path: &Path) -> Result<Imported, String> {
         objects.push(m.name.clone());
     }
     let tris = indices.len() / 3;
+    // `Mesh::from_parts` fits the model into a [-1, 1] box; strokes and polygon fills were
+    // recorded in Painter's units, so they go through the same fit.
+    let (lo, hi) = positions.iter().fold((glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+    let mesh_scale = 2.0 / (hi - lo).max_element().max(1e-6);
+    let to_mesh = glam::Mat4::from_scale(glam::Vec3::splat(mesh_scale)) * glam::Mat4::from_translation(-(lo + hi) * 0.5);
     let name = path.file_stem().map_or("Painter project".into(), |s| s.to_string_lossy().into_owned());
     let mut mesh = Mesh::from_parts(name, positions, Some(normals), uvs, indices);
     if mesh.indices.len() / 3 == tri_object.len() {
@@ -126,7 +148,7 @@ pub fn import(path: &Path) -> Result<Imported, String> {
 
     let mut sets = Vec::with_capacity(mesh.sets.len());
     let mut procedural = 0;
-    let mut strokes = 0;
+    let mut images = std::collections::HashMap::new();
     let mut other_channels: Vec<String> = Vec::new();
     for ms in &mesh.sets {
         let Some(set) = project.texture_sets.iter().find(|s| s.name == ms.name).or(if mesh.sets.len() == 1 { project.texture_sets.first() } else { None }) else {
@@ -190,14 +212,34 @@ pub fn import(path: &Path) -> Result<Imported, String> {
                 other_channels.push(n);
             }
         }
+        let mut urls = Vec::new();
         crate::spp::document::walk_layers(
             &set.layers,
             &mut |l, _| {
                 procedural += l.sources.iter().filter(|s| matches!(s, crate::spp::SourceInfo::Procedural { .. })).count();
-                strokes += l.strokes;
+                for a in l.content.iter().chain(&l.mask) {
+                    if let crate::spp::document::ActionKind::Fill { sources, .. } = &a.kind {
+                        urls.extend(sources.iter().filter_map(|s| match s {
+                            crate::spp::SourceInfo::Bitmap { url, .. } => Some(url.clone()),
+                            _ => None,
+                        }));
+                    }
+                }
             },
             0,
         );
+        for url in urls {
+            if images.contains_key(&url) {
+                continue;
+            }
+            match read_image(&mut file, &url) {
+                Ok(Some(img)) => {
+                    images.insert(url, img);
+                }
+                Ok(None) => left.push(format!("{}: an image a layer uses isn't stored in the project.", set.name)),
+                Err(e) => left.push(format!("{}: an image a layer uses couldn't be read ({e}).", set.name)),
+            }
+        }
         sets.push(ImportedSet { resolution, channels, layers: set.layers.clone() });
     }
     let unused: Vec<&str> =
@@ -211,15 +253,33 @@ pub fn import(path: &Path) -> Result<Imported, String> {
     left.push("Painter's baked mesh maps: Material Painter bakes its own from the model. If Painter baked from a high poly, load it in the bake window.".into());
     if procedural > 0 {
         left.push(format!(
-            "{procedural} procedural source{} (Substance materials, generators): Material Painter can't run them; their result is in the flattened layer.",
+            "{procedural} procedural source{} (Substance materials, generators, filters): Material Painter can't run Substance graphs. Smart masks come in as the closest Material Painter ones; materials and filters only in the flattened layer.",
             if procedural == 1 { "" } else { "s" }
         ));
     }
-    if strokes > 0 {
-        left.push(format!("{strokes} brush stroke{}: kept in the flattened layer, not as editable strokes.", if strokes == 1 { "" } else { "s" }));
-    }
 
-    Ok(Imported { mesh, sets, came, left })
+    Ok(Imported { mesh, sets, came, left, to_mesh, mesh_scale, images })
+}
+
+/// Decodes an image resource of the project (`None`: not stored in it).
+fn read_image(file: &mut SppFile, url: &str) -> Result<Option<ImportedImage>, String> {
+    let Some(blob) = file.image_resource_blob(url).map_err(|e| e.to_string())? else { return Ok(None) };
+    let plane = crate::spp::images::decode_image_resource(&blob, MAX_IMAGE).map_err(|e| e.to_string())?;
+    let n = plane.components.max(1);
+    let mut rgba = Vec::with_capacity((plane.width * plane.height * 4) as usize);
+    for px in plane.data.chunks_exact(n) {
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        match n {
+            1 => rgba.extend([q(px[0]), q(px[0]), q(px[0]), 255]),
+            2 => rgba.extend([q(px[0]), q(px[0]), q(px[0]), q(px[1])]),
+            3 => rgba.extend([q(px[0]), q(px[1]), q(px[2]), 255]),
+            _ => rgba.extend([q(px[0]), q(px[1]), q(px[2]), q(px[3])]),
+        }
+    }
+    let img = image::RgbaImage::from_raw(plane.width, plane.height, rgba).ok_or("image size")?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    Ok(Some(ImportedImage { width: img.width(), height: img.height(), rgba: img.into_raw(), png: std::sync::Arc::new(png) }))
 }
 
 fn to_u8(v: &[f32]) -> Vec<u8> {

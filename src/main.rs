@@ -18,6 +18,7 @@ mod import;
 mod library;
 mod mcp;
 mod mesh;
+mod pen;
 mod polyfill;
 mod post;
 mod presets;
@@ -25,11 +26,14 @@ mod presets;
 mod preview_test;
 mod raytrace;
 mod select;
+mod spacemouse;
 mod spp;
 mod spp_import;
 mod textures;
 mod theme;
 mod undo;
+mod unwrap;
+mod update;
 mod viewport;
 
 use eframe::{egui_wgpu, wgpu};
@@ -37,6 +41,8 @@ use std::sync::Arc;
 
 fn main() -> eframe::Result {
     crash::install();
+    // What the last update left behind (the download, the replaced files).
+    std::thread::spawn(update::clean_up);
     let mut options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Material Painter")
@@ -47,6 +53,7 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    pen::install(&mut options);
     // Request the adapter's full limits: high-poly bake sources need large
     // storage buffers, and the compositor binds many textures per pass.
     if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
@@ -57,11 +64,14 @@ fn main() -> eframe::Result {
             ..Default::default()
         });
     }
-    eframe::run_native(
+    let result = eframe::run_native(
         "Material Painter",
         options,
         Box::new(|cc| Ok(Box::new(app::PainterApp::new(cc)?))),
-    )
+    );
+    // An update downloaded in the app goes in now that the window is closed.
+    update::finish();
+    result
 }
 
 /// The window and taskbar icon (the copper material ball).

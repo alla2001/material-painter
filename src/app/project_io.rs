@@ -378,6 +378,16 @@ impl PainterApp {
         Ok(self.engine.texture_from_bytes(label, format, w, h, &bytes))
     }
 
+    /// A painted mask; older projects saved it as one channel.
+    fn mask_tex_from(&self, r: &Reader, v: &Value) -> Result<Tex, String> {
+        let tex = self.tex_from(r, v, "mask")?;
+        if tex.format != wgpu::TextureFormat::R8Unorm {
+            return Ok(tex);
+        }
+        let bytes = r.blob(&v["blob"])?;
+        Ok(self.engine.mask_from_bytes(tex.format, tex.width, tex.height, &bytes))
+    }
+
     /// One texture set's part of a project.
     fn set_json(&self, w: &mut Writer, engine: &Engine) -> Value {
         let mut layers = Vec::new();
@@ -405,7 +415,7 @@ impl PainterApp {
                 .images
                 .iter()
                 .map(|im| im.as_ref().filter(|_| !from_graph))
-                .map(|im| im.map_or(Value::Null, |im| json!({"name": im.name, "data": w.blob(&im.encoded)})))
+                .map(|im| im.map_or(Value::Null, |im| json!({"name": im.name, "data": w.blob(&im.encoded), "source": im.source.name()})))
                 .collect();
             layers.push(json!({
                 "images": images,
@@ -488,6 +498,7 @@ impl PainterApp {
                 let mut v = self.set_json(&mut w, engine);
                 v["name"] = json!(set.name);
                 v["tris"] = json!([set.tris.start, set.tris.end]);
+                v["udim"] = json!(set.udim);
                 v["selected"] = json!(selected);
                 v
             })
@@ -683,6 +694,8 @@ impl PainterApp {
             .collect();
         if ranges.len() == set_values.len() {
             mesh.set_ranges(ranges);
+            let tiles: Vec<Option<u32>> = set_values.iter().map(|sv| sv["udim"].as_u64().map(|t| t as u32)).collect();
+            mesh.set_udims(&tiles);
         }
         let set_count = mesh.sets.len();
 
@@ -731,7 +744,7 @@ impl PainterApp {
                 let mask = match lv.get("mask").filter(|m| !m.is_null()) {
                     Some(mv) => Some(Mask {
                         paint: match mv.get("paint").filter(|p| !p.is_null()) {
-                            Some(t) => Some(self.tex_from(&r, t, "mask")?),
+                            Some(t) => Some(self.mask_tex_from(&r, t)?),
                             None => None,
                         },
                         generator: match mv.get("generator").filter(|g| !g.is_null()) {
@@ -748,7 +761,8 @@ impl PainterApp {
                 for (k, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(crate::engine::CHANNELS) {
                     if !iv.is_null() {
                         let data = std::sync::Arc::new(r.blob(&iv["data"])?);
-                        images[k] = Some(self.engine.decode_channel_image(k, s(iv, "name").unwrap_or("image").to_string(), data)?);
+                        let source = crate::engine::ImageSource::from_name(s(iv, "source").unwrap_or(""));
+                        images[k] = Some(self.engine.decode_channel_image_from(k, s(iv, "name").unwrap_or("image").to_string(), data, source)?);
                     }
                 }
                 let blend_name = s(lv, "blend").unwrap_or("Normal");

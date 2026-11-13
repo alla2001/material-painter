@@ -160,7 +160,10 @@ fn raster(t: &[Vec2; 3], res: usize, pad: f32, mut f: impl FnMut(usize, f32)) {
 /// Writes the selection into an R8 mask of `res`² texels. The selection is
 /// padded by a few texels so filtering doesn't pull in the outside, but the
 /// padding never covers texels of unselected triangles.
-pub fn write_mask(mesh: &Mesh, selected: &[bool], res: u32, mask: &mut [u8], mode: MaskMode) {
+/// `mask` holds `texel` bytes per texel (the painted mask's r first; any
+/// other bytes, such as the value added over the smart mask, are cleared
+/// where the selection writes).
+pub fn write_mask(mesh: &Mesh, selected: &[bool], res: u32, mask: &mut [u8], texel: usize, mode: MaskMode) {
     const PAD: f32 = 3.0;
     let res_us = res as usize;
     let scale = res as f32;
@@ -185,12 +188,14 @@ pub fn write_mask(mesh: &Mesh, selected: &[bool], res: u32, mask: &mut [u8], mod
             });
         }
     }
-    for (m, &c) in mask.iter_mut().zip(&cover) {
-        *m = match (mode, c) {
+    for (m, &c) in mask.chunks_exact_mut(texel).zip(&cover) {
+        let r = match (mode, c) {
             (MaskMode::Subtract, true) => 0,
             (MaskMode::Replace | MaskMode::Add, true) => 255,
             (MaskMode::Replace, false) => 0,
-            (_, false) => *m,
+            (_, false) => continue,
         };
+        m[0] = r;
+        m[1..].fill(0);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "material_painter"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "A PBR texture painter: layers, smart materials, mesh map baking, material graphs and custom node shaders"
 license = "GPL-3.0-or-later"
@@ -13,11 +13,15 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 eframe = "0.37.0"
 egui_tiles = { version = "0.18", features = ["serde"] }
 glam = { version = "0.34.1", features = ["bytemuck"] }
+# 3D mice over USB HID: the pure-Rust backends on Windows and Linux (no system libraries).
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native", "linux-native-basic-udev", "macos-shared-device"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tga", "bmp", "tiff", "hdr", "exr"] }
 lz4_flex = "0.14.0"
 mikktspace = { version = "0.3.0", default-features = false, features = ["glam"] }
 notify = "8"
 rayon = "1.12.0"
+# SHA-256 of downloaded updates; already built in as ureq's TLS crypto.
+ring = "0.17"
 thiserror = "2"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,7 +31,18 @@ ufbx = "0.11.5"
 ureq = "3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Unpacking the Linux release tarball when the app updates itself (flate2 is already in
+# through ureq).
+[target.'cfg(target_os = "linux")'.dependencies]
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+
 # Dependencies are always optimized so debug builds stay interactive.
+# Pen side buttons (src/pen.rs): winit's event loop hook and the pen's pointer messages.
+[target.'cfg(windows)'.dependencies]
+winit = { version = "0.30", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_UI_Input_Pointer", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
 [profile.dev.package."*"]
 opt-level = 3
 
@@ -37,6 +52,10 @@ opt-level = 1
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[build-dependencies]
+# Compiles the vendored xatlas (automatic UV unwrapping).
+cc = "1.2"
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["wgpu", "eframe", "snapshot"] }

@@ -38,3 +38,41 @@ Name: "{autodesktop}\Material Painter"; Filename: "{app}\MaterialPainter.exe"; T
 
 [Run]
 Filename: "{app}\MaterialPainter.exe"; Description: "{cm:LaunchProgram,Material Painter}"; Flags: nowait postinstall skipifsilent
+; An update from inside the app (/RELAUNCH=1) starts the app again, as the user.
+Filename: "{app}\MaterialPainter.exe"; Flags: nowait runasoriginaluser; Check: RelaunchAfterUpdate
+
+[Code]
+// The app starts this setup as it closes and passes its process id (/WAITPID=1234):
+// wait for it to end so its files can be replaced. A minute at most, should it hang.
+const
+  SYNCHRONIZE = $00100000;
+
+function OpenProcess(DesiredAccess: DWORD; InheritHandle: BOOL; ProcessId: DWORD): THandle;
+  external 'OpenProcess@kernel32.dll stdcall';
+function WaitForSingleObject(Handle: THandle; Milliseconds: DWORD): DWORD;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(Handle: THandle): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+function InitializeSetup(): Boolean;
+var
+  Pid: Integer;
+  Process: THandle;
+begin
+  Pid := StrToIntDef(ExpandConstant('{param:WAITPID|0}'), 0);
+  if Pid > 0 then
+  begin
+    Process := OpenProcess(SYNCHRONIZE, False, Pid);
+    if Process <> 0 then
+    begin
+      WaitForSingleObject(Process, 60000);
+      CloseHandle(Process);
+    end;
+  end;
+  Result := True;
+end;
+
+function RelaunchAfterUpdate(): Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;

@@ -215,8 +215,10 @@ impl PainterApp {
             folder: PathBuf::from(&p.export_folder),
             mesh_name: self.export.mesh_name.clone(),
             project_name: self.project_path.as_ref().and_then(|p| p.file_stem()).map_or("Untitled".into(), |s| s.to_string_lossy().into_owned()),
-            set_name: self.mesh.sets.get(self.sets.active).map_or(String::new(), |s| s.name.replace(' ', "")),
-            set_count: self.mesh.sets.len(),
+            set_name: self.mesh.sets.get(self.sets.active).map_or(String::new(), |s| s.base_name().replace(' ', "")),
+            udim: self.mesh.sets.get(self.sets.active).and_then(|s| s.udim),
+            // Tiles of one material are one name.
+            set_count: self.mesh.sets.iter().map(|s| s.base_name()).collect::<std::collections::HashSet<_>>().len(),
             format: p.export_format,
             depth: p.export_depth,
             size: p.export_size,
@@ -240,7 +242,7 @@ impl PainterApp {
             .zip(engines)
             .map(|(set, engine)| {
                 let snapshot = export::snapshot(engine, &self.rs.device, &self.rs.queue, self.mesh.clone());
-                (snapshot, export::Settings { set_name: set.name.replace(' ', ""), ..settings.clone() })
+                (snapshot, export::Settings { set_name: set.base_name().replace(' ', ""), udim: set.udim, ..settings.clone() })
             })
             .collect()
     }
@@ -419,7 +421,7 @@ impl PainterApp {
                                 self.prefs.export_template = name;
                             }
                         }
-                        ui.label(egui::RichText::new("$mesh, $set (texture set) and $project in file names are replaced.").small().color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new("$mesh, $set (texture set), $udim (tile) and $project in file names are replaced. UDIM tiles without $udim get .1001 etc. at the end.").small().color(theme::TEXT_DIM));
                         egui::ScrollArea::vertical().id_salt("maps").show(ui, |ui| {
                             let t = &mut self.export.templates[sel];
                             let mut remove = None;

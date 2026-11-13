@@ -151,7 +151,7 @@ impl PainterApp {
                         let ext = Path::new(&im.name).extension().and_then(|e| e.to_str()).unwrap_or("png").to_lowercase();
                         let file = format!("images/{}_{ch}.{ext}", layers.len());
                         images.push((file.clone(), im.encoded.clone()));
-                        json!({"name": im.name, "file": file})
+                        json!({"name": im.name, "file": file, "source": im.source.name()})
                     }
                     None => Value::Null,
                 })
@@ -286,7 +286,8 @@ impl PainterApp {
             for (ch, iv) in lv["images"].as_array().into_iter().flatten().enumerate().take(crate::engine::CHANNELS) {
                 let Some(file) = iv["file"].as_str() else { continue };
                 let data = Arc::new(read(file)?);
-                images[ch] = Some(self.engine.decode_channel_image(ch, iv["name"].as_str().unwrap_or("image").to_string(), data)?);
+                let source = crate::engine::ImageSource::from_name(iv["source"].as_str().unwrap_or(""));
+                images[ch] = Some(self.engine.decode_channel_image_from(ch, iv["name"].as_str().unwrap_or("image").to_string(), data, source)?);
             }
             let mv = &lv["mask"];
             masks.push((!mv.is_null()).then(|| MaskPlan {

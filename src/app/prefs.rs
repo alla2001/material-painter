@@ -50,6 +50,14 @@ pub struct Preferences {
     pub default_resolution: u32,
     /// Bake mesh maps as soon as a mesh is loaded.
     pub bake_on_load: bool,
+    /// Which imported meshes get new UVs.
+    pub auto_unwrap: crate::mesh::AutoUnwrap,
+    /// Meshes with UVs in UDIM tiles get a texture set per tile.
+    pub udim_tiles: bool,
+    /// Ask GitHub for a newer release when the app starts.
+    pub check_updates: bool,
+    /// A release the user chose not to hear about again ("0.1.7").
+    pub skipped_update: String,
     // Interface
     pub ui_scale: f32,
     pub shelf_icon_size: f32,
@@ -60,6 +68,12 @@ pub struct Preferences {
     pub orbit_speed: f32,
     pub zoom_speed: f32,
     pub invert_zoom: bool,
+    /// Navigate the 3D view with a 3D mouse (SpaceMouse).
+    pub spacemouse: bool,
+    pub spacemouse_speed: f32,
+    pub spacemouse_invert_rotate: bool,
+    pub spacemouse_invert_pan: bool,
+    pub spacemouse_invert_zoom: bool,
     pub rt_max_samples: u32,
     pub rt_bounces: u32,
     // Painting
@@ -97,6 +111,10 @@ impl Default for Preferences {
             recent_count: 10,
             default_resolution: 2048,
             bake_on_load: true,
+            auto_unwrap: crate::mesh::AutoUnwrap::Missing,
+            udim_tiles: true,
+            check_updates: true,
+            skipped_update: String::new(),
             ui_scale: 1.0,
             shelf_icon_size: 72.0,
             default_hdri: "Small Studio".into(),
@@ -105,6 +123,11 @@ impl Default for Preferences {
             orbit_speed: 1.0,
             zoom_speed: 1.0,
             invert_zoom: false,
+            spacemouse: true,
+            spacemouse_speed: 1.0,
+            spacemouse_invert_rotate: false,
+            spacemouse_invert_pan: false,
+            spacemouse_invert_zoom: false,
             rt_max_samples: 512,
             rt_bounces: 4,
             brush_size: 70.0,
@@ -147,6 +170,16 @@ impl Preferences {
     }
 
     fn to_json(&self) -> Value {
+        let mut v = self.to_json_base();
+        // Past what one json! macro expands.
+        v["auto_unwrap"] = json!(self.auto_unwrap.key());
+        v["udim_tiles"] = json!(self.udim_tiles);
+        v["check_updates"] = json!(self.check_updates);
+        v["skipped_update"] = json!(self.skipped_update);
+        v
+    }
+
+    fn to_json_base(&self) -> Value {
         json!({
             "autosave": self.autosave,
             "autosave_every": self.autosave_every,
@@ -162,6 +195,11 @@ impl Preferences {
             "orbit_speed": self.orbit_speed,
             "zoom_speed": self.zoom_speed,
             "invert_zoom": self.invert_zoom,
+            "spacemouse": self.spacemouse,
+            "spacemouse_speed": self.spacemouse_speed,
+            "spacemouse_invert_rotate": self.spacemouse_invert_rotate,
+            "spacemouse_invert_pan": self.spacemouse_invert_pan,
+            "spacemouse_invert_zoom": self.spacemouse_invert_zoom,
             "rt_max_samples": self.rt_max_samples,
             "rt_bounces": self.rt_bounces,
             "brush_size": self.brush_size,
@@ -200,6 +238,10 @@ impl Preferences {
             recent_count: u("recent_count", d.recent_count as u64, 1, 30) as usize,
             default_resolution: res("default_resolution", d.default_resolution),
             bake_on_load: b("bake_on_load", d.bake_on_load),
+            auto_unwrap: v["auto_unwrap"].as_str().and_then(crate::mesh::AutoUnwrap::from_key).unwrap_or(d.auto_unwrap),
+            check_updates: b("check_updates", d.check_updates),
+            udim_tiles: b("udim_tiles", d.udim_tiles),
+            skipped_update: s("skipped_update", &d.skipped_update),
             ui_scale: f("ui_scale", d.ui_scale, 0.6, 2.5),
             shelf_icon_size: f("shelf_icon_size", d.shelf_icon_size, super::ICON_MIN, super::ICON_MAX),
             default_hdri: s("default_hdri", &d.default_hdri),
@@ -208,6 +250,11 @@ impl Preferences {
             orbit_speed: f("orbit_speed", d.orbit_speed, 0.1, 5.0),
             zoom_speed: f("zoom_speed", d.zoom_speed, 0.1, 5.0),
             invert_zoom: b("invert_zoom", d.invert_zoom),
+            spacemouse: b("spacemouse", d.spacemouse),
+            spacemouse_speed: f("spacemouse_speed", d.spacemouse_speed, 0.1, 5.0),
+            spacemouse_invert_rotate: b("spacemouse_invert_rotate", d.spacemouse_invert_rotate),
+            spacemouse_invert_pan: b("spacemouse_invert_pan", d.spacemouse_invert_pan),
+            spacemouse_invert_zoom: b("spacemouse_invert_zoom", d.spacemouse_invert_zoom),
             rt_max_samples: u("rt_max_samples", d.rt_max_samples as u64, 16, 16384) as u32,
             rt_bounces: u("rt_bounces", d.rt_bounces as u64, 1, 16) as u32,
             brush_size: f("brush_size", d.brush_size, 1.0, 1000.0),
@@ -331,12 +378,16 @@ impl PainterApp {
         match page {
             Page::General => {
                 (p.autosave, p.autosave_every, p.undo_steps, p.recent_count) = (d.autosave, d.autosave_every, d.undo_steps, d.recent_count);
-                (p.default_resolution, p.bake_on_load) = (d.default_resolution, d.bake_on_load);
+                (p.default_resolution, p.bake_on_load, p.auto_unwrap) = (d.default_resolution, d.bake_on_load, d.auto_unwrap);
+                (p.check_updates, p.udim_tiles) = (d.check_updates, d.udim_tiles);
             }
             Page::Interface => (p.ui_scale, p.shelf_icon_size) = (d.ui_scale, d.shelf_icon_size),
             Page::Viewport => {
                 (p.default_hdri, p.key_light, p.fov_deg) = (d.default_hdri, d.key_light, d.fov_deg);
                 (p.orbit_speed, p.zoom_speed, p.invert_zoom) = (d.orbit_speed, d.zoom_speed, d.invert_zoom);
+                (p.spacemouse, p.spacemouse_speed) = (d.spacemouse, d.spacemouse_speed);
+                (p.spacemouse_invert_rotate, p.spacemouse_invert_pan, p.spacemouse_invert_zoom) =
+                    (d.spacemouse_invert_rotate, d.spacemouse_invert_pan, d.spacemouse_invert_zoom);
                 (p.rt_max_samples, p.rt_bounces) = (d.rt_max_samples, d.rt_bounces);
             }
             Page::Painting => {
@@ -356,6 +407,13 @@ impl PainterApp {
         let builtins = self.env_builtins.clone();
         let templates: Vec<String> = self.export.templates.iter().map(|t| t.name.clone()).collect();
         let mcp_url = self.mcp.as_ref().map(|s| s.url());
+        let space = match (&self.space.device, &self.space.problem) {
+            (Some(d), _) => format!("Connected: {}", d.name()),
+            (None, Some(problem)) => problem.clone(),
+            (None, None) => String::new(),
+        };
+        let mut look_again = false;
+        let mut check_now = false;
         let p = &mut self.prefs;
         match self.prefs_ui.page {
             Page::General => {
@@ -363,6 +421,16 @@ impl PainterApp {
                 labeled(ui, "Resolution", |ui| resolution_combo(ui, "pref res", &mut p.default_resolution));
                 hint(ui, "Texture size of new projects. Change the current project's size in the texture set settings.");
                 ui.checkbox(&mut p.bake_on_load, "Bake mesh maps when a mesh is loaded");
+                labeled(ui, "Auto-unwrap", |ui| {
+                    egui::ComboBox::from_id_salt("pref unwrap").selected_text(p.auto_unwrap.name()).width(240.0).show_ui(ui, |ui| {
+                        for m in crate::mesh::AutoUnwrap::ALL {
+                            ui.selectable_value(&mut p.auto_unwrap, m, m.name());
+                        }
+                    });
+                });
+                hint(ui, "New UVs for imported meshes, one layout per texture set (material). A set with any object lacking UVs is unwrapped whole. Export the mesh (File > Export mesh) to use the new UVs elsewhere.");
+                ui.checkbox(&mut p.udim_tiles, "UDIM tiles: a texture set per tile");
+                hint(ui, "For meshes laid out across UV tiles (1001, 1002, …): each tile of a material gets its own textures, exported as Name_BaseColor.1001.png. Turn off for meshes that move islands out of 0..1 on purpose (mirrored parts offset by one), so they keep sharing the textures.");
                 ui.horizontal(|ui| {
                     if ui.button("Clear bake cache").clicked() {
                         crate::bake_cache::clear();
@@ -377,6 +445,12 @@ impl PainterApp {
                 });
                 labeled(ui, "Undo steps", |ui| ui.add(egui::DragValue::new(&mut p.undo_steps).range(8..=512)));
                 hint(ui, "More steps keep more painted texture history in memory.");
+                section(ui, "Updates");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut p.check_updates, "Check for a new version when the app starts");
+                    check_now = ui.button("Check now").clicked();
+                });
+                hint(ui, "Asks GitHub for the latest release; nothing about you or your work is sent. A new version downloads only when you say so.");
             }
             Page::Interface => {
                 section(ui, "Scale");
@@ -400,6 +474,23 @@ impl PainterApp {
                 labeled(ui, "Orbit speed", |ui| ui.add(egui::Slider::new(&mut p.orbit_speed, 0.1..=5.0).max_decimals(2).suffix("x")));
                 labeled(ui, "Zoom speed", |ui| ui.add(egui::Slider::new(&mut p.zoom_speed, 0.1..=5.0).max_decimals(2).suffix("x")));
                 ui.checkbox(&mut p.invert_zoom, "Invert scroll zoom");
+                section(ui, "3D mouse");
+                ui.checkbox(&mut p.spacemouse, "Navigate with a 3D mouse (SpaceMouse)");
+                ui.add_enabled_ui(p.spacemouse, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Look again").clicked() {
+                            look_again = true;
+                        }
+                        hint(ui, &space);
+                    });
+                    labeled(ui, "Speed", |ui| ui.add(egui::Slider::new(&mut p.spacemouse_speed, 0.1..=5.0).max_decimals(2).suffix("x")));
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut p.spacemouse_invert_rotate, "Invert rotation");
+                        ui.checkbox(&mut p.spacemouse_invert_pan, "Invert pan");
+                        ui.checkbox(&mut p.spacemouse_invert_zoom, "Invert zoom");
+                    });
+                    hint(ui, "The model follows the cap: twist or tilt to turn it, push to move it, pull to bring it closer. The side buttons frame the model.");
+                });
                 section(ui, "Ray traced preview");
                 labeled(ui, "Max samples", |ui| ui.add(egui::DragValue::new(&mut p.rt_max_samples).range(16..=16384)));
                 labeled(ui, "Bounces", |ui| ui.add(egui::DragValue::new(&mut p.rt_bounces).range(1..=16)));
@@ -469,6 +560,12 @@ impl PainterApp {
                 let info = self.rs.adapter.get_info();
                 labeled(ui, "Current", |ui| ui.label(format!("{} ({:?})", info.name, info.backend)));
             }
+        }
+        if look_again {
+            self.space.scan = true;
+        }
+        if check_now {
+            self.check_for_updates(ui.ctx(), true);
         }
     }
 

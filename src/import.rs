@@ -14,8 +14,8 @@ pub struct RawMesh {
     pub positions: Vec<Vec3>,
     /// `None` when the file has no normals; callers generate smooth ones.
     pub normals: Option<Vec<Vec3>>,
-    /// `None` when any part of the file lacks UVs.
-    pub uvs: Option<Vec<Vec2>>,
+    /// Zero for the objects without UVs (`object_has_uv`).
+    pub uvs: Vec<Vec2>,
     pub indices: Vec<u32>,
     /// Material index per triangle.
     pub tri_material: Vec<u32>,
@@ -25,6 +25,8 @@ pub struct RawMesh {
     /// Object (mesh node) index per triangle, into `objects`.
     pub tri_object: Vec<u32>,
     pub objects: Vec<String>,
+    /// Whether each object came with UVs.
+    pub object_has_uv: Vec<bool>,
     /// Average vertex color per triangle (sRGB), when every object has them.
     pub tri_color: Option<Vec<[u8; 3]>>,
     /// Objects without UVs, for error messages.
@@ -58,12 +60,9 @@ fn load_obj(path: &Path) -> Result<RawMesh, String> {
         let count = mesh.positions.len() / 3;
         let has_uv = mesh.texcoords.len() >= count * 2;
         let has_n = mesh.normals.len() >= count * 3;
-        if !has_uv {
-            out.missing_uvs.push(m.name.clone());
-        }
         let material = mesh.material_id.unwrap_or(0) as u32;
         let has_c = mesh.vertex_color.len() >= count * 3;
-        out.begin_object(&m.name);
+        out.begin_object(&m.name, has_uv);
         for &i in &mesh.indices {
             let i = i as usize;
             out.push_corner(Corner {
@@ -106,11 +105,8 @@ fn load_fbx(path: &Path) -> Result<RawMesh, String> {
         let normal_m = ufbx::matrix_for_normals(&to_world);
         let has_uv = mesh.vertex_uv.exists;
         let has_n = mesh.vertex_normal.exists;
-        if !has_uv {
-            out.missing_uvs.push(node.element.name.to_string());
-        }
         let has_c = mesh.vertex_color.exists;
-        out.begin_object(&node.element.name);
+        out.begin_object(&node.element.name, has_uv);
         tri.resize(mesh.max_face_triangles * 3, 0u32);
         for (face_index, &face) in mesh.faces.iter().enumerate() {
             let n = mesh.triangulate_face(&mut tri, face) as usize;
@@ -161,13 +157,13 @@ struct Builder {
     indices: Vec<u32>,
     tri_material: Vec<u32>,
     all_normals: bool,
-    all_uvs: bool,
     corners: usize,
     weld: HashMap<[u32; 9], u32>,
     missing_uvs: Vec<String>,
     max_material: u32,
     material_names: Vec<String>,
     objects: Vec<String>,
+    object_has_uv: Vec<bool>,
     tri_object: Vec<u32>,
     all_colors: bool,
     tri_color: Vec<[u8; 3]>,
@@ -177,19 +173,21 @@ struct Builder {
 
 impl Builder {
     /// Starts a new object; its triangles are tagged with its index.
-    fn begin_object(&mut self, name: &str) {
+    fn begin_object(&mut self, name: &str, has_uv: bool) {
         self.objects.push(name.to_string());
+        self.object_has_uv.push(has_uv);
+        if !has_uv {
+            self.missing_uvs.push(name.to_string());
+        }
     }
 
     fn push_corner(&mut self, c: Corner) {
         if self.corners == 0 {
             self.all_normals = true;
-            self.all_uvs = true;
             self.all_colors = true;
         }
         self.corners += 1;
         self.all_normals &= c.normal.is_some();
-        self.all_uvs &= c.uv.is_some();
         self.all_colors &= c.color.is_some();
         self.color_acc += c.color.unwrap_or(Vec3::ZERO);
         if self.corners % 3 == 0 {
@@ -227,7 +225,7 @@ impl Builder {
             name: String::new(),
             positions: self.positions,
             normals: self.all_normals.then_some(self.normals),
-            uvs: self.all_uvs.then_some(self.uvs),
+            uvs: self.uvs,
             indices: self.indices,
             tri_material: self.tri_material,
             material_count: self.max_material + 1,
@@ -235,6 +233,7 @@ impl Builder {
             missing_uvs: self.missing_uvs,
             tri_object: self.tri_object,
             objects: self.objects,
+            object_has_uv: self.object_has_uv,
             tri_color: (self.all_colors && self.corners > 0).then_some(self.tri_color),
         }
     }
@@ -250,11 +249,10 @@ mod tests {
         for path in list.split(';').filter(|p| !p.is_empty()) {
             let m = super::load(std::path::Path::new(path)).unwrap_or_else(|e| panic!("{path}: {e}"));
             println!(
-                "{path}: {} verts, {} tris, normals {}, uvs {}, materials {}, missing uvs {:?}",
+                "{path}: {} verts, {} tris, normals {}, materials {}, missing uvs {:?}",
                 m.positions.len(),
                 m.indices.len() / 3,
                 m.normals.is_some(),
-                m.uvs.is_some(),
                 m.material_count,
                 m.missing_uvs
             );

@@ -163,7 +163,7 @@ impl PainterApp {
             })),
             "load_mesh" => {
                 let mesh = if let Some(path) = str_arg(args, "path") {
-                    Mesh::load_file(std::path::Path::new(path))?
+                    Mesh::load_file_with(std::path::Path::new(path), self.prefs.auto_unwrap, self.prefs.udim_tiles, &|_| {})?.0
                 } else if let Some(name) = str_arg(args, "primitive") {
                     Primitive::ALL.iter().find(|p| eq(p.name(), name)).ok_or(format!("unknown primitive '{name}'"))?.build()
                 } else {

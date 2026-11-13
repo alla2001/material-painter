@@ -220,16 +220,20 @@ struct AccumOut {
 };
 
 // The layer's mask before opacity: the painted mask (or, with mask filters,
-// the filtered mask) times the smart mask.
+// the filtered mask) times the smart mask, plus what the painted mask adds
+// on top (its green; see `fs_mask` in apply.wgsl).
 fn layer_mask(c: vec2<i32>, p: vec3<f32>, n: vec3<f32>, uv: vec2<f32>) -> f32 {
     var mask = 1.0;
+    var add = 0.0;
     if (u.p0.w > 0.5) {
-        mask *= textureLoad(l_mask, c, 0).r;
+        let painted = textureLoad(l_mask, c, 0);
+        mask = painted.r;
+        add = painted.g;
     }
     if (u.gp1.z > 0.5) {
         mask *= generator(p, n, uv, texel_size(c, p));
     }
-    return mask;
+    return clamp(mask + add, 0.0, 1.0);
 }
 
 // The layer's mask alone, as the first step of its mask filters.
@@ -391,15 +395,19 @@ fn fs_layer(in: FsOut) -> AccumOut {
 fn fs_folder_merge(in: FsOut) -> AccumOut {
     let c = vec2<i32>(in.pos.xy);
     let uv = in.pos.xy / vec2<f32>(textureDimensions(prev_color));
-    var m = u.p0.x;
+    var m = 1.0;
+    var add = 0.0;
     if (u.p0.w > 0.5) {
-        m *= textureLoad(l_mask, c, 0).r;
+        let painted = textureLoad(l_mask, c, 0);
+        m = painted.r;
+        add = painted.g;
     }
     if (u.gp1.z > 0.5) {
         let p = textureLoad(pos_map, c, 0).xyz;
         let n = normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0);
         m *= generator(p, n, uv, texel_size(c, p));
     }
+    m = u.p0.x * clamp(m + add, 0.0, 1.0);
     var out: AccumOut;
     out.color = mix(textureLoad(l_color, c, 0), textureLoad(prev_color, c, 0), m);
     out.rough = vec4<f32>(mix(textureLoad(l_rough, c, 0).r, textureLoad(prev_rough, c, 0).r, m));

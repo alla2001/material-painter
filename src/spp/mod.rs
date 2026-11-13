@@ -78,6 +78,11 @@ impl<R: Read + Seek> SppFile<R> {
         Ok(self.h5.read(&info)?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn bytes_for_probe(&mut self, path: &str) -> Vec<u8> {
+        self.bytes(path).expect("dataset")
+    }
+
     pub fn meshes(&mut self) -> Result<Vec<DumpMesh>, SppError> {
         Ok(assbin::parse(&self.bytes("paint/scene.assbin")?)?)
     }

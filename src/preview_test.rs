@@ -208,6 +208,7 @@ fn export_templates() {
                 mesh_name: "Cube".into(),
                 project_name: "Test".into(),
                 set_name: "Cube".into(),
+                udim: None,
                 set_count: 1,
                 format,
                 depth: *format.depths().last().unwrap(),
@@ -1576,6 +1577,13 @@ fn open_spp_projects() {
             println!("    vram {name}: {total} MB {parts:?}");
         }
         harness.render().expect("renders").save(dir.join(format!("spp_{k}.png"))).unwrap();
+        // How close the rebuilt stack alone comes to Painter's own result.
+        for (name, diff) in harness.state_mut().test_spp_compare(&dir) {
+            println!("    rebuilt vs Painter, {name}: base color {:.3}, roughness {:.3}, metallic {:.3}", diff[0], diff[1], diff[2]);
+        }
+        if std::env::var("MP_SPP_QUICK").is_ok() {
+            continue;
+        }
         // The path tracer reads every set.
         harness.state_mut().test_ray_trace(true);
         harness.run_steps(8);
@@ -1589,6 +1597,64 @@ fn open_spp_projects() {
         assert_eq!(harness.state().test_sets(), sets, "{path}: the project round-trips");
         let _ = std::fs::remove_file(&project);
     }
+}
+
+/// A mesh laid out in UDIM tiles (`MP_UDIM=<obj or fbx>`): a texture set per tile, each
+/// baked, the frame in `target/bake_test/udim/`, the tiles surviving save and reopen, and
+/// the exported files named <name>.<tile>.
+#[test]
+#[ignore]
+fn udim_mesh() {
+    use crate::app::PainterApp;
+    let Ok(path) = std::env::var("MP_UDIM") else {
+        println!("set MP_UDIM to a mesh laid out in UDIM tiles");
+        return;
+    };
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| wgpu::DeviceDescriptor {
+        label: Some("ui test device"),
+        required_limits: adapter.limits(),
+        ..Default::default()
+    });
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size([1600.0, 1000.0])
+        .with_pixels_per_point(1.0)
+        .with_accessibility_check(false)
+        .wgpu_setup(egui_wgpu::WgpuSetup::CreateNew(setup))
+        .build_eframe(|cc| PainterApp::new(cc).expect("app starts"));
+    harness.run_steps(4);
+    harness.state_mut().test_close_welcome();
+    let mesh = Mesh::load_file(Path::new(&path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let ctx = harness.ctx.clone();
+    harness.state_mut().test_load_mesh(mesh, &ctx);
+    let tiles = harness.state().test_udims();
+    println!("  sets: {:?}", harness.state().test_sets().iter().map(|s| s.0.clone()).collect::<Vec<_>>());
+    assert!(tiles.len() > 1 && tiles.iter().all(Option::is_some), "a set per tile: {tiles:?}");
+    let mut steps = 0;
+    while harness.state().test_baking() && steps < 20_000 {
+        harness.run_steps(1);
+        steps += 1;
+    }
+    assert!(!harness.state().test_baking(), "every tile baked");
+    harness.run_steps(2);
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test/udim");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    harness.render().expect("renders").save(dir.join("udim.png")).unwrap();
+    // Saved and reopened, the tiles stay.
+    let sets = harness.state().test_sets();
+    let project = dir.join("udim.mpp");
+    harness.state_mut().test_save_and_reopen(&project, &ctx).expect("saves and reopens");
+    harness.run_steps(2);
+    assert_eq!(harness.state().test_sets(), sets);
+    assert_eq!(harness.state().test_udims(), tiles);
+    // Each tile's files end in its number.
+    let files = harness.state_mut().test_export(&dir.join("textures")).expect("exports");
+    for tile in tiles.iter().flatten() {
+        let ending = format!(".{tile}.png");
+        assert!(files.iter().any(|f| f.to_string_lossy().ends_with(&ending)), "a file for {tile}: {files:?}");
+    }
+    println!("  {} files, e.g. {:?}", files.len(), files.iter().take(4).map(|f| f.file_name().unwrap()).collect::<Vec<_>>());
 }
 
 /// Two texture sets on one plane (left and right halves of the UV square):
@@ -2239,6 +2305,7 @@ fn transparency_paints_shows_and_exports() {
             mesh_name: "Plane".into(),
             project_name: "Test".into(),
             set_name: name.into(),
+            udim: None,
             set_count: 2,
             format: Format::Png,
             depth: export::Depth::U8,
@@ -2263,6 +2330,7 @@ fn transparency_paints_shows_and_exports() {
         mesh_name: "Opaque".into(),
         project_name: "Test".into(),
         set_name: "Opaque".into(),
+        udim: None,
         set_count: 1,
         format: Format::Png,
         depth: export::Depth::U8,
@@ -2550,6 +2618,7 @@ fn normal_and_specular_channels() {
         mesh_name: name.into(),
         project_name: "Test".into(),
         set_name: name.into(),
+        udim: None,
         set_count: 1,
         format: Format::Png,
         depth: export::Depth::U8,
@@ -2831,6 +2900,7 @@ fn emission_paints_glows_and_exports() {
         mesh_name: name.into(),
         project_name: "Test".into(),
         set_name: name.into(),
+        udim: None,
         set_count: 1,
         format: Format::Png,
         depth: export::Depth::U8,

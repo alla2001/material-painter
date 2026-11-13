@@ -476,10 +476,13 @@ pub struct Settings {
     pub mesh_name: String,
     /// `$project` in file names.
     pub project_name: String,
-    /// `$set` in file names: the texture set exported.
+    /// `$set` in file names: the texture set exported (a UDIM set's material name).
     pub set_name: String,
+    /// The UDIM tile exported: `$udim` in file names, or ".1001" after the name.
+    pub udim: Option<u32>,
     /// Texture sets in the document. With more than one, names without
-    /// `$set` get it after `$mesh`, so sets don't overwrite each other.
+    /// `$set` get it after `$mesh`, so sets don't overwrite each other (tiles of one
+    /// material count once).
     pub set_count: usize,
     pub format: Format,
     pub depth: Depth,
@@ -503,7 +506,12 @@ impl Settings {
         if self.set_count > 1 && !name.contains("$set") {
             name = if name.contains("$mesh") { name.replace("$mesh", "$mesh_$set") } else { format!("$set_{name}") };
         }
-        let stem = name.replace("$mesh", &self.mesh_name).replace("$set", &self.set_name).replace("$project", &self.project_name);
+        let mut stem = name.replace("$mesh", &self.mesh_name).replace("$set", &self.set_name).replace("$project", &self.project_name);
+        match self.udim {
+            Some(tile) if stem.contains("$udim") => stem = stem.replace("$udim", &tile.to_string()),
+            Some(tile) => stem = format!("{stem}.{tile}"),
+            None => stem = stem.replace("$udim", ""),
+        }
         let stem: String = stem.chars().map(|c| if r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect();
         format!("{stem}.{}", self.format.ext())
     }
@@ -1033,12 +1041,37 @@ mod tests {
     }
 
     #[test]
+    fn udim_tiles_name_their_files() {
+        let s = Settings {
+            folder: PathBuf::new(),
+            mesh_name: "Hero".into(),
+            project_name: "P".into(),
+            set_name: "Skin".into(),
+            udim: Some(1002),
+            set_count: 1,
+            format: Format::Png,
+            depth: Depth::U8,
+            size: None,
+            padding: Padding::Infinite,
+            normal_strength: 1.0,
+            use_baked_normal: true,
+        };
+        assert_eq!(s.file_name(&OutputMap::height("$mesh_Height")), "Hero_Height.1002.png");
+        assert_eq!(s.file_name(&OutputMap::height("$mesh_Height_$udim")), "Hero_Height_1002.png");
+        let two = Settings { set_count: 2, ..s.clone() };
+        assert_eq!(two.file_name(&OutputMap::height("$mesh_Height")), "Hero_Skin_Height.1002.png");
+        let plain = Settings { udim: None, ..s };
+        assert_eq!(plain.file_name(&OutputMap::height("$mesh_Height")), "Hero_Height.png");
+    }
+
+    #[test]
     fn depth_follows_the_format() {
         let mut s = Settings {
             folder: PathBuf::new(),
             mesh_name: "M".into(),
             project_name: "P".into(),
             set_name: "S".into(),
+            udim: None,
             set_count: 1,
             format: Format::Png,
             depth: Depth::U8,

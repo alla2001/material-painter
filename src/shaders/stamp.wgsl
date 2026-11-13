@@ -105,31 +105,42 @@ fn coverage_screen(screen: vec2<f32>) -> f32 {
     return 1.0 - keep;
 }
 
-// Coverage of discs lying on the surface: the texel's offset from the stamp
-// center, measured in the stamp's tangent plane.
+// One disc lying on the surface: the texel's offset from the stamp center,
+// measured in the stamp's tangent plane.
+fn stamp_surface(s: Stamp, p: vec3<f32>, n: vec3<f32>) -> f32 {
+    let r = s.center.w;
+    if (r <= 0.0) {
+        return 0.0;
+    }
+    let d = p - s.center.xyz;
+    let nc = s.normal.xyz;
+    // A slab one radius thick, so paint can't reach the far side of a thin wall.
+    if (abs(dot(d, nc)) > r) {
+        return 0.0;
+    }
+    let face = facing(dot(n, nc));
+    if (face <= 0.0) {
+        return 0.0;
+    }
+    let x = s.tangent.xyz;
+    let y = cross(x, nc);
+    return clamp(falloff(vec2<f32>(dot(d, x), dot(d, y)) / r, s.screen.w) * face * flow(s), 0.0, 1.0);
+}
+
+// One disc in texture space.
+fn stamp_uv(s: Stamp, uv: vec2<f32>) -> f32 {
+    if (s.center.w <= 0.0) {
+        return 0.0;
+    }
+    return clamp(falloff((uv - s.uv.xy) / max(s.normal.w, 1e-6), s.screen.w) * flow(s), 0.0, 1.0);
+}
+
+// Coverage of discs lying on the surface.
 fn coverage_surface(p: vec3<f32>, n: vec3<f32>) -> f32 {
     var keep = 1.0;
     let count = u32(u.view.w);
     for (var i = 0u; i < count; i++) {
-        let s = stamps[i];
-        let r = s.center.w;
-        if (r <= 0.0) {
-            continue;
-        }
-        let d = p - s.center.xyz;
-        let nc = s.normal.xyz;
-        // A slab one radius thick, so paint can't reach the far side of a thin wall.
-        if (abs(dot(d, nc)) > r) {
-            continue;
-        }
-        let face = facing(dot(n, nc));
-        if (face <= 0.0) {
-            continue;
-        }
-        let x = s.tangent.xyz;
-        let y = cross(x, nc);
-        let fall = falloff(vec2<f32>(dot(d, x), dot(d, y)) / r, s.screen.w) * face;
-        keep *= 1.0 - clamp(fall * flow(s), 0.0, 1.0);
+        keep *= 1.0 - stamp_surface(stamps[i], p, n);
     }
     return 1.0 - keep;
 }
@@ -139,12 +150,7 @@ fn coverage_uv(uv: vec2<f32>) -> f32 {
     var keep = 1.0;
     let count = u32(u.view.w);
     for (var i = 0u; i < count; i++) {
-        let s = stamps[i];
-        if (s.center.w <= 0.0) {
-            continue;
-        }
-        let fall = falloff((uv - s.uv.xy) / max(s.normal.w, 1e-6), s.screen.w);
-        keep *= 1.0 - clamp(fall * flow(s), 0.0, 1.0);
+        keep *= 1.0 - stamp_uv(stamps[i], uv);
     }
     return 1.0 - keep;
 }
@@ -192,4 +198,51 @@ fn fs_stamp(in: FsOut) -> @location(0) vec4<f32> {
         discard;
     }
     return vec4<f32>(a, 0.0, 0.0, 1.0);
+}
+
+// Replaying recorded strokes (imports): each stamp is drawn only over the
+// triangles it can reach (at their UVs, found on the CPU), instead of every
+// texel testing every stamp. The flow blend sums the draws as
+// `coverage_surface` / `coverage_uv` sum the stamps.
+struct SplatOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) stamp: u32,
+};
+
+@vertex
+fn vs_splat(@location(0) uv: vec2<f32>, @location(1) stamp: u32) -> SplatOut {
+    var out: SplatOut;
+    out.pos = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    out.stamp = stamp;
+    return out;
+}
+
+fn splat(in: SplatOut, padding: bool) -> vec4<f32> {
+    let c = vec2<i32>(in.pos.xy);
+    let p = textureLoad(pos_map, c, 0);
+    // Padding strips only fill texels outside every UV island (as poly.wgsl).
+    if (p.a < 0.5 || (padding && p.a > 0.9)) {
+        discard;
+    }
+    let s = stamps[in.stamp];
+    var a = 0.0;
+    if (u.proj.x > 1.5) {
+        a = stamp_uv(s, in.pos.xy / vec2<f32>(textureDimensions(pos_map)));
+    } else {
+        a = stamp_surface(s, p.xyz, normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0));
+    }
+    if (a <= 0.0) {
+        discard;
+    }
+    return vec4<f32>(a, 0.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_splat(in: SplatOut) -> @location(0) vec4<f32> {
+    return splat(in, false);
+}
+
+@fragment
+fn fs_splat_pad(in: SplatOut) -> @location(0) vec4<f32> {
+    return splat(in, true);
 }

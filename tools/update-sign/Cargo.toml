@@ -1,0 +1,10 @@
+[package]
+name = "update-sign"
+version = "0.1.0"
+edition = "2024"
+description = "Signs Material Painter release packages for the in-app updater"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+ring = "0.17"

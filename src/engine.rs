@@ -54,7 +54,11 @@ const POS_FORMAT: F = F::Rgba16Float;
 const NRM_FORMAT: F = F::Rgba8Unorm;
 /// Tangent and bitangent sign per texel (see `uvbake.wgsl`).
 const TAN_FORMAT: F = F::Rgba8Unorm;
-const MASK_FORMAT: F = F::R8Unorm;
+/// Painted masks: (r) a multiplier of the smart mask, (g) a value added on
+/// top. A layer's mask is `r * smart mask + g`; painting in the app writes r
+/// (and clears g where it paints), Painter imports lay strokes over the smart
+/// mask through both (see [`Engine::set_mask_over`]).
+pub(crate) const MASK_FORMAT: F = F::Rg8Unorm;
 /// Filtered masks keep 16 bits, so blur and levels don't band.
 const MASK_FILTER_FORMAT: F = F::R16Float;
 /// Uniform slots for mask filter steps per composite (dynamic offsets).
@@ -605,6 +609,74 @@ pub struct FillImage {
     pub tex: Arc<Tex>,
     pub name: String,
     pub encoded: Arc<Vec<u8>>,
+    /// The part of the file an opacity image reads.
+    pub source: ImageSource,
+}
+
+/// Which part of an image an opacity image reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ImageSource {
+    /// The alpha when the file has some transparency, else the brightness.
+    #[default]
+    Auto,
+    Alpha,
+    Brightness,
+    Red,
+    Green,
+    Blue,
+}
+
+impl ImageSource {
+    pub const ALL: [ImageSource; 6] = [Self::Auto, Self::Alpha, Self::Brightness, Self::Red, Self::Green, Self::Blue];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Alpha => "Alpha",
+            Self::Brightness => "Brightness",
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+        }
+    }
+
+    pub fn tip(self) -> &'static str {
+        match self {
+            Self::Auto => "The alpha channel when the image has transparency, otherwise its brightness",
+            Self::Alpha => "The alpha channel (fully opaque if the image has none)",
+            Self::Brightness => "How light the image is: white solid, black cut out",
+            Self::Red => "The red channel (packed masks)",
+            Self::Green => "The green channel (packed masks)",
+            Self::Blue => "The blue channel (packed masks)",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        Self::ALL.into_iter().find(|s| s.name() == name).unwrap_or_default()
+    }
+
+    /// The single-channel image this source reads from `img`.
+    pub fn extract(self, img: image::DynamicImage) -> image::GrayImage {
+        let channel = |rgba: image::RgbaImage, k: usize| {
+            image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| image::Luma([rgba.get_pixel(x, y)[k]]))
+        };
+        match self {
+            Self::Auto if img.color().has_alpha() => {
+                let rgba = img.into_rgba8();
+                if rgba.pixels().all(|p| p[3] == 255) {
+                    // An alpha channel with nothing in it: a mask saved as RGBA.
+                    image::DynamicImage::ImageRgba8(rgba).into_luma8()
+                } else {
+                    channel(rgba, 3)
+                }
+            }
+            Self::Auto | Self::Brightness => img.into_luma8(),
+            Self::Alpha => channel(img.into_rgba8(), 3),
+            Self::Red => channel(img.into_rgba8(), 0),
+            Self::Green => channel(img.into_rgba8(), 1),
+            Self::Blue => channel(img.into_rgba8(), 2),
+        }
+    }
 }
 
 /// Largest image edge kept on the GPU; bigger files are scaled down.
@@ -949,7 +1021,25 @@ struct ActiveStroke {
     layer_id: u64,
     target: StrokeTarget,
     channels: Vec<usize>,
-    before: Snapshot,
+    /// The target before the stroke, for undo (`None`: a replay, unrecorded).
+    before: Option<Snapshot>,
+}
+
+/// Recorded strokes to replay (imports): up to [`MAX_STAMPS`] stamps, and
+/// the UV triangles each one can reach (vertices with the stamp's index into
+/// `stamps`), with their island-border padding strips.
+#[derive(Default)]
+pub struct SplatBatch {
+    pub stamps: Vec<Stamp>,
+    pub faces: Vec<SplatVertex>,
+    pub padding: Vec<SplatVertex>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SplatVertex {
+    pub uv: [f32; 2],
+    pub stamp: u32,
 }
 
 struct Pipelines {
@@ -958,6 +1048,9 @@ struct Pipelines {
     dilate_bgl: wgpu::BindGroupLayout,
     stamp: wgpu::RenderPipeline,
     stamp_bgl: wgpu::BindGroupLayout,
+    /// Replayed stamps drawn over the triangles they reach (`vs_splat`).
+    splat: wgpu::RenderPipeline,
+    splat_pad: wgpu::RenderPipeline,
     poly: wgpu::RenderPipeline,
     /// Polygon fill padding: only where no UV island is (reads the position map).
     poly_pad: wgpu::RenderPipeline,
@@ -975,6 +1068,8 @@ struct Pipelines {
     mask_filter: wgpu::RenderPipeline,
     mask_filter_bgl: wgpu::BindGroupLayout,
     resample: HashMap<F, wgpu::RenderPipeline>,
+    /// Gray images into painted masks (see `fs_resample_mask`).
+    resample_mask: wgpu::RenderPipeline,
     resample_bgl: wgpu::BindGroupLayout,
     resolve: HashMap<F, wgpu::RenderPipeline>,
     resolve_bgl: wgpu::BindGroupLayout,
@@ -1051,6 +1146,11 @@ pub struct Engine {
     active: Option<ActiveStroke>,
     /// Set whenever the layer stack changes; cleared by [`Engine::composite`].
     pub dirty: bool,
+    /// Mask strokes go over everything below them, the smart mask included
+    /// (Painter's order), instead of scaling the smart mask; see `apply.wgsl`.
+    mask_over: bool,
+    /// The (unread) depth binding of replayed stamps, made on first use.
+    splat_depth: Option<wgpu::TextureView>,
     /// Something besides the painted layer changed since the last composite.
     full_dirty: bool,
     /// The layer the current stroke paints (content or mask).
@@ -1172,6 +1272,8 @@ impl Engine {
             bounds,
             active: None,
             dirty: true,
+            mask_over: false,
+            splat_depth: None,
             full_dirty: true,
             stroke_layer: None,
             prefix: None,
@@ -1288,6 +1390,39 @@ impl Engine {
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         );
+
+        let splat_layout = gpu::layout(device, &stamp_bgl);
+        let splat_pipeline = |label: &str, fs: &str| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&splat_layout),
+            vertex: wgpu::VertexState {
+                module: &stamp_module,
+                entry_point: Some("vs_splat"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<SplatVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Uint32],
+                })],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &stamp_module,
+                entry_point: Some(fs),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: STROKE_FORMAT,
+                    blend: Some(wgpu::BlendState { color: flow_blend, alpha: flow_blend }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let splat = splat_pipeline("splat", "fs_splat");
+        let splat_pad = splat_pipeline("splat padding", "fs_splat_pad");
 
         // Polygon fill: selected triangles rasterized at their UVs into the stroke mask.
         let poly_module = gpu::shader(device, "poly fill", include_str!("shaders/poly.wgsl"));
@@ -1460,6 +1595,7 @@ impl Engine {
                 (f, pl)
             })
             .collect();
+        let resample_mask = gpu::fullscreen_pipeline(device, "resample mask", &resample_module, "fs_resample_mask", &resample_layout, &[gpu::target(MASK_FORMAT)]);
 
         // Mesh-map levels and painted fixes.
         let resolve_module = gpu::shader(device, "maps resolve", include_str!("shaders/maps_resolve.wgsl"));
@@ -1497,6 +1633,8 @@ impl Engine {
             dilate_bgl,
             stamp,
             stamp_bgl,
+            splat,
+            splat_pad,
             poly,
             poly_pad,
             poly_pad_bgl,
@@ -1512,6 +1650,7 @@ impl Engine {
             mask_filter,
             mask_filter_bgl,
             resample,
+            resample_mask,
             resample_bgl,
             resolve,
             resolve_bgl,
@@ -1765,7 +1904,7 @@ impl Engine {
         // A channel the graph has no output for keeps the layer's value.
         let mut images: [Option<FillImage>; CHANNELS] = Default::default();
         for (slot, o) in images.iter_mut().zip(outputs) {
-            *slot = o.map(|tex| FillImage { tex, name: name.to_string(), encoded: Arc::new(Vec::new()) });
+            *slot = o.map(|tex| FillImage { tex, name: name.to_string(), encoded: Arc::new(Vec::new()), source: ImageSource::Auto });
         }
         layer.images = images;
         self.mark_dirty();
@@ -1781,7 +1920,19 @@ impl Engine {
         }
         let Some(dst) = self.layers[idx].mask.as_ref().and_then(|m| m.paint.as_ref()) else { return };
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.resample_into(&mut encoder, src, dst);
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.p.resample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        let mut pass = gpu::pass(&mut encoder, "graph mask", &[gpu::color_attachment(&dst.view, wgpu::LoadOp::Load)]);
+        pass.set_pipeline(&self.p.resample_mask);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
         self.queue.submit([encoder.finish()]);
         self.invalidate_thumbs();
         self.mark_dirty();
@@ -1901,6 +2052,23 @@ impl Engine {
     // ------------------------------------------------------------------ projects
 
     /// A layer-sized texture holding `bytes` (tightly packed texels).
+    /// Mask strokes go over the whole mask below them, smart mask included
+    /// (Painter's order: for importing its projects), instead of setting the
+    /// smart mask's multiplier as the app's brush does.
+    pub fn set_mask_over(&mut self, over: bool) {
+        self.mask_over = over;
+    }
+
+    /// A painted mask from saved texels: masks saved before they had a value
+    /// added over the smart mask (one byte per texel) come in with none.
+    pub fn mask_from_bytes(&self, format: F, width: u32, height: u32, bytes: &[u8]) -> Tex {
+        if format == F::R8Unorm {
+            let rg: Vec<u8> = bytes.iter().flat_map(|&r| [r, 0]).collect();
+            return self.texture_from_bytes("mask", MASK_FORMAT, width, height, &rg);
+        }
+        self.texture_from_bytes("mask", format, width, height, bytes)
+    }
+
     pub fn texture_from_bytes(&self, label: &str, format: F, width: u32, height: u32, bytes: &[u8]) -> Tex {
         let tex = Tex::new(&self.device, label, width, height, format, LAYER_USAGE);
         let row = width * gpu::bytes_per_texel(format);
@@ -1981,7 +2149,7 @@ impl Engine {
         let name = format!("{dir}{}", path.file_name().map_or("image".into(), |n| n.to_string_lossy()));
         if let Some((tex, encoded)) = self.image_cache.get(path) {
             if let Some(tex) = tex.upgrade() {
-                return Ok(FillImage { tex, name, encoded: encoded.clone() });
+                return Ok(FillImage { tex, name, encoded: encoded.clone(), source: ImageSource::Auto });
             }
         }
         let encoded = Arc::new(std::fs::read(path).map_err(|e| format!("can't read {}: {e}", path.display()))?);
@@ -1997,23 +2165,35 @@ impl Engine {
         let img = image::load_from_memory(&encoded).map_err(|e| format!("can't read {name}: {e}"))?;
         let gray = matches!(img.color(), image::ColorType::L8 | image::ColorType::L16);
         let tex = if gray { self.upload_mips(img.into_luma8(), F::R8Unorm) } else { self.upload_mips(img.into_rgba8(), F::Rgba8Unorm) };
-        Ok(FillImage { tex: Arc::new(tex), name, encoded })
+        Ok(FillImage { tex: Arc::new(tex), name, encoded, source: ImageSource::Auto })
     }
 
     /// An image for fill channel `ch`. Opacity takes the image's alpha when
-    /// it has one (a cut-out: leaves, lace, decals), else its brightness.
+    /// it has transparency (a cut-out: leaves, lace, decals), else its brightness.
     pub fn decode_channel_image(&self, ch: usize, name: String, encoded: Arc<Vec<u8>>) -> Result<FillImage, String> {
+        self.decode_channel_image_from(ch, name, encoded, ImageSource::Auto)
+    }
+
+    /// An image for fill channel `ch`; opacity reads the image's `source` part.
+    pub fn decode_channel_image_from(&self, ch: usize, name: String, encoded: Arc<Vec<u8>>, source: ImageSource) -> Result<FillImage, String> {
         if ch != OPACITY {
             return self.decode_fill_image(name, encoded);
         }
         let img = image::load_from_memory(&encoded).map_err(|e| format!("can't read {name}: {e}"))?;
-        let gray = if img.color().has_alpha() {
-            let rgba = img.into_rgba8();
-            image::GrayImage::from_fn(rgba.width(), rgba.height(), |x, y| image::Luma([rgba.get_pixel(x, y)[3]]))
-        } else {
-            img.into_luma8()
-        };
-        Ok(FillImage { tex: Arc::new(self.upload_mips(gray, F::R8Unorm)), name, encoded })
+        let gray = source.extract(img);
+        Ok(FillImage { tex: Arc::new(self.upload_mips(gray, F::R8Unorm)), name, encoded, source })
+    }
+
+    /// Reads a fill layer's opacity image again from another part of the file
+    /// (alpha, brightness, one color channel); one undo step.
+    pub fn set_image_source(&mut self, idx: usize, source: ImageSource, undo: &mut UndoStack) -> Result<(), String> {
+        let Some(im) = self.layers.get(idx).and_then(|l| l.images[OPACITY].clone()) else { return Ok(()) };
+        if im.source == source || im.encoded.is_empty() {
+            return Ok(());
+        }
+        let image = self.decode_channel_image_from(OPACITY, im.name.clone(), im.encoded.clone(), source)?;
+        self.set_fill_image(idx, OPACITY, Some(image), undo);
+        Ok(())
     }
 
     fn upload_mips<P: image::Pixel<Subpixel = u8> + 'static>(&self, mut img: image::ImageBuffer<P, Vec<u8>>, format: F) -> Tex {
@@ -2035,7 +2215,7 @@ impl Engine {
         // Opacity reads the image's alpha (or brightness): decoded for that.
         let image = match image {
             Some(im) if ch == OPACITY && im.tex.format != F::R8Unorm && !im.encoded.is_empty() => {
-                self.decode_channel_image(ch, im.name.clone(), im.encoded.clone()).ok().or(Some(im))
+                self.decode_channel_image_from(ch, im.name.clone(), im.encoded.clone(), im.source).ok().or(Some(im))
             }
             other => other,
         };
@@ -2432,7 +2612,8 @@ impl Engine {
         let tex = self.layers[idx].mask.as_ref().and_then(|m| m.paint.as_ref()).expect("mask paint exists");
 
         let mut texels = gpu::read_texture(&self.device, &self.queue, tex);
-        crate::select::write_mask(mesh, selected, self.res, &mut texels, mode);
+        let texel = gpu::bytes_per_texel(tex.format) as usize;
+        crate::select::write_mask(mesh, selected, self.res, &mut texels, texel, mode);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let before = Snapshot::encode(&self.device, &mut encoder, &[tex]);
@@ -2442,7 +2623,7 @@ impl Engine {
         self.queue.write_texture(
             tex.copy_info(),
             &texels,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.res), rows_per_image: Some(self.res) },
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.res * texel as u32), rows_per_image: Some(self.res) },
             tex.extent(),
         );
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -2664,7 +2845,7 @@ impl Engine {
         let tex = Tex::new(&self.device, "mask", self.res, self.res, MASK_FORMAT, LAYER_USAGE);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let v = if white { 1.0 } else { 0.0 };
-        gpu::clear_texture(&mut encoder, &tex, wgpu::Color { r: v, g: v, b: v, a: 1.0 });
+        gpu::clear_texture(&mut encoder, &tex, wgpu::Color { r: v, g: 0.0, b: 0.0, a: 1.0 });
         self.queue.submit([encoder.finish()]);
         tex
     }
@@ -2731,6 +2912,18 @@ impl Engine {
     /// Starts a stroke on the content or mask of layer `idx`. Returns false if
     /// there is nothing paintable there.
     pub fn begin_stroke(&mut self, idx: usize, target: StrokeTarget, enabled: [bool; CHANNELS], erase: bool) -> bool {
+        self.begin(idx, target, enabled, erase, true)
+    }
+
+    /// Starts replaying recorded strokes into a layer's content or mask
+    /// (imports): as [`Engine::begin_stroke`], without undo snapshots. Lay
+    /// them down with [`Engine::replay_splats`] / [`Engine::replay_polys`],
+    /// then [`Engine::finish_replay`].
+    pub fn begin_replay(&mut self, idx: usize, target: StrokeTarget, enabled: [bool; CHANNELS], erase: bool) -> bool {
+        !matches!(target, StrokeTarget::BakeFix(_)) && self.begin(idx, target, enabled, erase, false)
+    }
+
+    fn begin(&mut self, idx: usize, target: StrokeTarget, enabled: [bool; CHANNELS], erase: bool, record: bool) -> bool {
         if let StrokeTarget::BakeFix(map) = target {
             if !self.begin_fix_stroke(map, erase) {
                 return false;
@@ -2739,7 +2932,7 @@ impl Engine {
             if self.snap[c].is_none() {
                 self.snap[c] = Some(Tex::new(&self.device, "snapshot", self.res, self.res, PAINT_FORMATS[c], LAYER_USAGE));
             }
-            return self.encode_stroke_start(0, target, vec![c]);
+            return self.encode_stroke_start(0, target, vec![c], record);
         }
         let Some(layer) = self.layers.get(idx) else { return false };
         let layer_id = layer.id;
@@ -2777,11 +2970,12 @@ impl Engine {
             }
             StrokeTarget::BakeFix(_) => unreachable!("handled above"),
         }
-        self.encode_stroke_start(layer_id, target, channels)
+        self.encode_stroke_start(layer_id, target, channels, record)
     }
 
-    /// Snapshots the stroke target (stroke base + undo "before") and clears the stroke mask.
-    fn encode_stroke_start(&mut self, layer_id: u64, target: StrokeTarget, channels: Vec<usize>) -> bool {
+    /// Snapshots the stroke target (stroke base, and undo "before" when
+    /// `record`) and clears the stroke mask.
+    fn encode_stroke_start(&mut self, layer_id: u64, target: StrokeTarget, channels: Vec<usize>, record: bool) -> bool {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         gpu::clear_texture(&mut encoder, &self.stroke, wgpu::Color::TRANSPARENT);
         let textures = self.target_textures(layer_id, target, &channels).expect("stroke target exists");
@@ -2792,11 +2986,130 @@ impl Engine {
         for (src, dst) in textures.iter().zip(&snaps) {
             encoder.copy_texture_to_texture(src.copy_info(), dst.copy_info(), src.extent());
         }
-        let before = Snapshot::encode(&self.device, &mut encoder, &textures);
+        let before = record.then(|| Snapshot::encode(&self.device, &mut encoder, &textures));
         self.queue.submit([encoder.finish()]);
-        before.request_map();
+        if let Some(b) = &before {
+            b.request_map();
+        }
         self.active = Some(ActiveStroke { layer_id, target, channels, before });
         true
+    }
+
+    /// Lays a batch of replayed stamps into the stroke (see [`SplatBatch`]).
+    /// `su` gives the brush (hardness, flow, tip) and the projection: surface
+    /// or UV stamps (the screen projection needs a view, which replays lack).
+    pub fn replay_splats(&mut self, batch: &SplatBatch, mut su: StampUniform) {
+        if self.active.is_none() || batch.stamps.is_empty() || batch.faces.is_empty() && batch.padding.is_empty() {
+            return;
+        }
+        let stamps = &batch.stamps[..batch.stamps.len().min(MAX_STAMPS)];
+        su.view[2] = 0.0;
+        su.view[3] = stamps.len() as f32;
+        self.queue.write_buffer(&self.stamp_ubuf, 0, bytemuck::bytes_of(&su));
+        self.queue.write_buffer(&self.stamp_sbuf, 0, bytemuck::cast_slice(stamps));
+        use wgpu::util::DeviceExt;
+        let buffer = |v: &[SplatVertex]| {
+            (!v.is_empty()).then(|| {
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("splats"), contents: bytemuck::cast_slice(v), usage: wgpu::BufferUsages::VERTEX })
+            })
+        };
+        let (faces, padding) = (buffer(&batch.faces), buffer(&batch.padding));
+        // No view: the depth binding is a placeholder the splat shader never reads.
+        if self.splat_depth.is_none() {
+            let t = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("replay depth"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: crate::viewport::MSAA,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::viewport::DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.splat_depth = Some(t.create_view(&Default::default()));
+        }
+        let depth = self.splat_depth.as_ref().expect("made above");
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("splat"),
+            layout: &self.p.stamp_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.stamp_ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.stamp_sbuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.pos.view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.nrm.view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(depth) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.brush_alpha.view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = gpu::pass(&mut encoder, "splat", &[gpu::color_attachment(&self.stroke.view, wgpu::LoadOp::Load)]);
+            pass.set_bind_group(0, &bg, &[]);
+            if let Some(b) = &faces {
+                pass.set_pipeline(&self.p.splat);
+                pass.set_vertex_buffer(0, b.slice(..));
+                pass.draw(0..batch.faces.len() as u32, 0..1);
+            }
+            if let Some(b) = &padding {
+                pass.set_pipeline(&self.p.splat_pad);
+                pass.set_vertex_buffer(0, b.slice(..));
+                pass.draw(0..batch.padding.len() as u32, 0..1);
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// Adds whole triangles (UV vertices, three per triangle, with their
+    /// padding) to a replayed stroke: Painter's polygon fills.
+    pub fn replay_polys(&mut self, geometry: &PolyGeometry) {
+        if self.active.is_none() || geometry.faces.is_empty() {
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_polys(&mut encoder, geometry);
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// Writes a replayed stroke into its target with `paint` and ends it.
+    pub fn finish_replay(&mut self, paint: &BrushPaint) {
+        if self.active.is_none() {
+            return;
+        }
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_apply(&mut encoder, paint);
+        self.queue.submit([encoder.finish()]);
+        self.active = None;
+        self.stroke_layer = None;
+        self.prefix = None;
+        self.prefix_cache = None;
+        self.stroke_region = None;
+        self.region_unknown = false;
+        self.invalidate_thumbs();
+        self.mark_dirty();
+    }
+
+    /// The painted mask of layer `idx` as texels (r, g per texel), creating
+    /// it (white) if the mask has none.
+    pub fn mask_texels(&mut self, idx: usize) -> Option<Vec<u8>> {
+        self.layers.get(idx)?.mask.as_ref()?;
+        self.ensure_mask_paint(idx);
+        let tex = self.layers[idx].mask.as_ref()?.paint.as_ref()?;
+        Some(gpu::read_texture(&self.device, &self.queue, tex))
+    }
+
+    /// Replaces the painted mask of layer `idx` (texels as [`Engine::mask_texels`]
+    /// gives them; derived data: no history entry).
+    pub fn set_mask_texels(&mut self, idx: usize, texels: &[u8]) {
+        self.ensure_mask_paint(idx);
+        let Some(tex) = self.layers.get(idx).and_then(|l| l.mask.as_ref()).and_then(|m| m.paint.as_ref()) else { return };
+        let row = tex.width * gpu::bytes_per_texel(tex.format);
+        if texels.len() != (row * tex.height) as usize {
+            return;
+        }
+        self.queue.write_texture(tex.copy_info(), texels, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None }, tex.extent());
+        self.invalidate_thumbs();
+        self.mark_dirty();
     }
 
     fn apply_pipeline(&self, mask: u8) -> wgpu::RenderPipeline {
@@ -2872,6 +3185,15 @@ impl Engine {
             ([lo[0].min(p[0]), lo[1].min(p[1])], [hi[0].max(p[0]), hi[1].max(p[1])])
         });
         self.add_region(Some([lo[0], lo[1], hi[0], hi[1]]));
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_polys(&mut encoder, geometry);
+        self.encode_apply(&mut encoder, paint);
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// Draws whole triangles (and their padding strips) into the stroke mask.
+    fn encode_polys(&self, encoder: &mut wgpu::CommandEncoder, geometry: &PolyGeometry) {
+        let (faces, padding) = (&geometry.faces, &geometry.padding);
         use wgpu::util::DeviceExt;
         let all: Vec<[f32; 2]> = faces.iter().chain(padding).copied().collect();
         let vertices = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2884,25 +3206,16 @@ impl Engine {
             layout: &self.p.poly_pad_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.pos.view) }],
         });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = gpu::pass(
-                &mut encoder,
-                "poly fill",
-                &[gpu::color_attachment(&self.stroke.view, wgpu::LoadOp::Load)],
-            );
-            pass.set_vertex_buffer(0, vertices.slice(..));
-            pass.set_pipeline(&self.p.poly);
-            pass.draw(0..faces.len() as u32, 0..1);
-            // Padding only where no UV island is: never onto a neighbor's texels.
-            if !padding.is_empty() {
-                pass.set_pipeline(&self.p.poly_pad);
-                pass.set_bind_group(0, &pos_map, &[]);
-                pass.draw(faces.len() as u32..all.len() as u32, 0..1);
-            }
+        let mut pass = gpu::pass(encoder, "poly fill", &[gpu::color_attachment(&self.stroke.view, wgpu::LoadOp::Load)]);
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_pipeline(&self.p.poly);
+        pass.draw(0..faces.len() as u32, 0..1);
+        // Padding only where no UV island is: never onto a neighbor's texels.
+        if !padding.is_empty() {
+            pass.set_pipeline(&self.p.poly_pad);
+            pass.set_bind_group(0, &pos_map, &[]);
+            pass.draw(faces.len() as u32..all.len() as u32, 0..1);
         }
-        self.encode_apply(&mut encoder, paint);
-        self.queue.submit([encoder.finish()]);
     }
 
     /// Brush grain (`size`² grayscale, tileable), or `None` for no grain.
@@ -2946,7 +3259,7 @@ impl Engine {
             color: [m.color[0], m.color[1], m.color[2], m.opacity],
             rmh: [m.rough, m.metal, m.height, paint.mask_value],
             ch: [ch[0], ch[1], ch[2], ch[3]],
-            p: [paint.opacity, if paint.erase { 1.0 } else { 0.0 }, ch[OPACITY], 0.0],
+            p: [paint.opacity, if paint.erase { 1.0 } else { 0.0 }, ch[OPACITY], if self.mask_over { 1.0 } else { 0.0 }],
             // Bake fixes paint exact values; grain would only get in the way.
             g: if matches!(target, StrokeTarget::BakeFix(_)) { [0.0; 4] } else { paint.grain },
             e: [m.emission[0], m.emission[1], m.emission[2], ch[EMISSION]],
@@ -3135,6 +3448,7 @@ impl Engine {
         self.stroke_region = None;
         self.region_unknown = false;
         let active = self.active.take()?;
+        let before = active.before?;
         let textures = self.target_textures(active.layer_id, active.target, &active.channels)?;
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let after = Snapshot::encode(&self.device, &mut encoder, &textures);
@@ -3144,7 +3458,7 @@ impl Engine {
             layer_id: active.layer_id,
             target: active.target,
             channels: active.channels,
-            before: active.before,
+            before,
             after,
         })
     }
@@ -3691,23 +4005,6 @@ impl Engine {
 
     // ------------------------------------------------------------------ resolution
 
-    /// Draws `src` over all of `dst` (any filterable float format into one
-    /// the resample pipelines target).
-    fn resample_into(&self, encoder: &mut wgpu::CommandEncoder, src: &Tex, dst: &Tex) {
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.p.resample_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        });
-        let mut pass = gpu::pass(encoder, "resample", &[gpu::color_attachment(&dst.view, wgpu::LoadOp::Load)]);
-        pass.set_pipeline(&self.p.resample[&dst.format]);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.draw(0..3, 0..1);
-    }
-
     /// Draws `src` over all of `dst`, a view of a texture of format `format`
     /// (any of the layer, final and mesh-map formats); for copies at another size.
     pub fn resample_to_view(&self, encoder: &mut wgpu::CommandEncoder, src: &Tex, dst: &wgpu::TextureView, format: F) {
@@ -3850,5 +4147,34 @@ impl Engine {
             ("paint layers", mb(self.layers.iter().map(|l| l.vram_bytes()).sum())),
             ("fill images", mb(unique_images)),
         ]
+    }
+}
+
+#[cfg(test)]
+mod image_source_tests {
+    use super::ImageSource;
+
+    fn px(img: image::DynamicImage, s: ImageSource) -> u8 {
+        s.extract(img).get_pixel(0, 0)[0]
+    }
+
+    #[test]
+    fn opacity_reads_the_chosen_part_of_the_image() {
+        let one = |c: [u8; 4]| image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(1, 1, image::Rgba(c)));
+        let see_through = one([200, 100, 50, 30]);
+        assert_eq!(px(see_through.clone(), ImageSource::Auto), 30);
+        assert_eq!(px(see_through.clone(), ImageSource::Alpha), 30);
+        assert_eq!(px(see_through.clone(), ImageSource::Red), 200);
+        assert_eq!(px(see_through.clone(), ImageSource::Green), 100);
+        assert_eq!(px(see_through, ImageSource::Blue), 50);
+        // A black mask saved with an empty alpha channel reads as black, not solid.
+        assert_eq!(px(one([0, 0, 0, 255]), ImageSource::Auto), 0);
+        assert_eq!(px(one([0, 0, 0, 255]), ImageSource::Alpha), 255);
+        assert_eq!(px(one([255, 255, 255, 255]), ImageSource::Brightness), 255);
+        let gray = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(1, 1, image::Luma([77])));
+        assert_eq!(px(gray, ImageSource::Auto), 77);
+        for s in ImageSource::ALL {
+            assert_eq!(ImageSource::from_name(s.name()), s);
+        }
     }
 }

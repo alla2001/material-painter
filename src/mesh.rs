@@ -1,4 +1,5 @@
-//! Mesh data, procedural preview meshes and OBJ import.
+//! Mesh data, procedural preview meshes, OBJ/FBX import (with automatic unwrapping of
+//! objects that have no UVs) and OBJ export.
 //!
 //! UVs are stored "texture-down": t = 0 is the top row of every texture, which
 //! matches how GPU textures and image files are laid out. OBJ files (v-up) are
@@ -9,12 +10,53 @@ use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::ops::Range;
 
+/// When importing a mesh makes new UVs (Substance Painter's auto-unwrap). Each texture set
+/// (material) is unwrapped on its own into the whole 0..1 square.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AutoUnwrap {
+    /// Meshes without UVs are refused.
+    Off,
+    /// Texture sets with any object lacking UVs are unwrapped; the others keep theirs.
+    Missing,
+    /// Every texture set is unwrapped, replacing the file's UVs.
+    All,
+}
+
+impl AutoUnwrap {
+    pub const ALL: [AutoUnwrap; 3] = [AutoUnwrap::Missing, AutoUnwrap::All, AutoUnwrap::Off];
+    pub fn name(self) -> &'static str {
+        match self {
+            AutoUnwrap::Off => "Off (meshes need UVs)",
+            AutoUnwrap::Missing => "Where UVs are missing",
+            AutoUnwrap::All => "Always (replace the mesh's UVs)",
+        }
+    }
+    pub fn key(self) -> &'static str {
+        match self {
+            AutoUnwrap::Off => "off",
+            AutoUnwrap::Missing => "missing",
+            AutoUnwrap::All => "all",
+        }
+    }
+    pub fn from_key(key: &str) -> Option<AutoUnwrap> {
+        AutoUnwrap::ALL.into_iter().find(|m| m.key() == key)
+    }
+}
+
+/// The texture set name of material `m` (before duplicates get numbers).
+fn material_name(names: &[String], m: u32) -> String {
+    names.get(m as usize).filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| format!("Material {}", m + 1))
+}
+
 /// A texture set: the triangles of one material, which get their own layer
 /// stack and textures. A set's triangles are contiguous in `Mesh::indices`,
 /// and its UV edges and seams contiguous in `uv_edges` and `seam_edges`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeshSet {
     pub name: String,
+    /// The UDIM tile (1001, 1002, …) the set's triangles came from, when the mesh was laid
+    /// out in tiles: each tile of a material is a set of its own, its UVs moved into 0..1.
+    pub udim: Option<u32>,
     /// Triangles (not indices).
     pub tris: Range<u32>,
     /// Index ranges into `uv_edges` and `seam_edges`.
@@ -23,6 +65,15 @@ pub struct MeshSet {
 }
 
 impl MeshSet {
+    /// The material's name without the tile ("Body" for "Body.1002"): what `$set` names
+    /// in exported files, the tile number going after it.
+    pub fn base_name(&self) -> &str {
+        match self.udim {
+            Some(tile) => self.name.strip_suffix(&format!(".{tile}")).unwrap_or(&self.name),
+            None => &self.name,
+        }
+    }
+
     /// The set's range in `Mesh::indices`.
     pub fn index_range(&self) -> Range<u32> {
         self.tris.start * 3..self.tris.end * 3
@@ -234,12 +285,23 @@ impl Mesh {
     /// has one entry per triangle; `names` names the materials. Materials
     /// without triangles get no set.
     pub fn split_by_material(&mut self, tri_material: &[u32], names: &[String]) {
+        self.split_by_material_and_tile(tri_material, names, None);
+    }
+
+    /// `split_by_material`, and with `tiles` (UDIM tile per triangle, from
+    /// `split_into_udims`) one set per tile of each material, named "Material.1001".
+    pub fn split_by_material_and_tile(&mut self, tri_material: &[u32], names: &[String], tiles: Option<&[u32]>) {
         let tris = self.triangle_count();
-        if tri_material.len() != tris {
-            return;
-        }
+        let tiles = tiles.filter(|t| t.len() == tris);
+        let one_material = vec![0; tris];
+        let tri_material = match tri_material.len() == tris {
+            true => tri_material,
+            false if tiles.is_some() => &one_material,
+            false => return,
+        };
+        let tile = |t: usize| tiles.map(|tiles| tiles[t]);
         let mut order: Vec<usize> = (0..tris).collect();
-        order.sort_by_key(|&t| tri_material[t]);
+        order.sort_by_key(|&t| (tri_material[t], tile(t)));
         let mut indices = Vec::with_capacity(self.indices.len());
         for &t in &order {
             indices.extend_from_slice(&self.indices[t * 3..t * 3 + 3]);
@@ -252,12 +314,19 @@ impl Mesh {
             self.tri_color = Some(order.iter().map(|&t| c[t]).collect());
         }
         let mut ranges: Vec<(String, Range<u32>)> = Vec::new();
+        let mut range_tiles: Vec<Option<u32>> = Vec::new();
         for (k, &t) in order.iter().enumerate() {
             let m = tri_material[t];
-            let name = names.get(m as usize).filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| format!("Material {}", m + 1));
+            let name = match tile(t) {
+                Some(tile) => format!("{}.{tile}", material_name(names, m)),
+                None => material_name(names, m),
+            };
             match ranges.last_mut() {
                 Some((n, r)) if *n == name && r.end == k as u32 => r.end += 1,
-                _ => ranges.push((name, k as u32..k as u32 + 1)),
+                _ => {
+                    ranges.push((name, k as u32..k as u32 + 1));
+                    range_tiles.push(tile(t));
+                }
             }
         }
         // Two materials with one name share a set only when adjacent; keep
@@ -271,6 +340,74 @@ impl Mesh {
             }
         }
         self.set_ranges(ranges);
+        self.set_udims(&range_tiles);
+    }
+
+    /// The UDIM tile of each set (from a saved project), when there's one per set.
+    pub fn set_udims(&mut self, tiles: &[Option<u32>]) {
+        if tiles.len() == self.sets.len() {
+            for (set, &tile) in self.sets.iter_mut().zip(tiles) {
+                set.udim = tile;
+            }
+        }
+    }
+
+    /// When the UVs are laid out in UDIM tiles (islands in more than the 0..1 square, each
+    /// triangle inside one tile), moves every triangle's UVs into 0..1 and returns its tile
+    /// (1001 + u + 10 v). Vertices shared by triangles of two tiles are split. `None` (and
+    /// nothing changed) for a 0..1 layout, or UVs that repeat across tile borders.
+    pub fn split_into_udims(&mut self) -> Option<Vec<u32>> {
+        const EPS: f32 = 1e-3;
+        let tris = self.triangle_count();
+        let mut tiles: Vec<(u32, u32)> = Vec::with_capacity(tris);
+        for t in 0..tris {
+            // UDIM v counts up; UVs are stored texture-down.
+            let uv = |c: usize| {
+                let [u, v] = self.vertices[self.indices[t * 3 + c] as usize].uv;
+                (u, 1.0 - v)
+            };
+            let corners = [uv(0), uv(1), uv(2)];
+            let (cu, cv) = corners.iter().fold((0.0, 0.0), |(a, b), (u, v)| (a + u / 3.0, b + v / 3.0));
+            let (tu, tv) = (cu.floor(), cv.floor());
+            if !(0.0..10.0).contains(&tu) || !(0.0..100.0).contains(&tv) {
+                return None;
+            }
+            let inside = |x: f32, lo: f32| x >= lo - EPS && x <= lo + 1.0 + EPS;
+            if !corners.iter().all(|&(u, v)| inside(u, tu) && inside(v, tv)) {
+                return None;
+            }
+            tiles.push((tu as u32, tv as u32));
+        }
+        if tiles.iter().all(|&t| t == (0, 0)) {
+            return None;
+        }
+        // Each vertex belongs to one tile; a vertex on a tile border used by both gets a copy.
+        let mut owner: Vec<Option<(u32, u32)>> = vec![None; self.vertices.len()];
+        let mut copies: HashMap<(u32, (u32, u32)), u32> = HashMap::new();
+        for (t, &tile) in tiles.iter().enumerate() {
+            for c in 0..3 {
+                let v = self.indices[t * 3 + c];
+                match owner[v as usize] {
+                    None => owner[v as usize] = Some(tile),
+                    Some(o) if o == tile => {}
+                    Some(_) => {
+                        let copy = *copies.entry((v, tile)).or_insert_with(|| {
+                            self.vertices.push(self.vertices[v as usize]);
+                            owner.push(Some(tile));
+                            (self.vertices.len() - 1) as u32
+                        });
+                        self.indices[t * 3 + c] = copy;
+                    }
+                }
+            }
+        }
+        for (vertex, tile) in self.vertices.iter_mut().zip(&owner) {
+            if let Some((tu, tv)) = *tile {
+                vertex.uv[0] -= tu as f32;
+                vertex.uv[1] += tv as f32;
+            }
+        }
+        Some(tiles.into_iter().map(|(u, v)| 1001 + u + 10 * v).collect())
     }
 
     /// Sets the texture sets from `(name, triangle range)` pairs covering
@@ -294,7 +431,7 @@ impl Mesh {
                 self.uv_edges.extend(polygon_edges(&self.vertices, idx));
                 let s0 = self.seam_edges.len() as u32;
                 self.seam_edges.extend(seam_edges(&self.vertices, idx));
-                MeshSet { name, tris, edges: e0..self.uv_edges.len() as u32, seams: s0..self.seam_edges.len() as u32 }
+                MeshSet { name, udim: None, tris, edges: e0..self.uv_edges.len() as u32, seams: s0..self.seam_edges.len() as u32 }
             })
             .collect();
     }
@@ -304,25 +441,165 @@ impl Mesh {
         self.sets.iter().position(|s| s.tris.contains(&tri)).unwrap_or(0)
     }
 
-    /// Loads an OBJ or FBX as the paintable mesh. Every object needs UVs.
+    /// Loads an OBJ or FBX as the paintable mesh, unwrapping texture sets without UVs.
+    #[cfg(test)]
     pub fn load_file(path: &std::path::Path) -> Result<Mesh, String> {
-        let raw = crate::import::load(path)?;
-        let Some(uvs) = raw.uvs else {
-            let names = raw.missing_uvs.join(", ");
-            return Err(format!("These objects have no UVs: {names}. Unwrap the mesh before importing it."));
+        Self::load_file_with(path, AutoUnwrap::Missing, true, &|_| {}).map(|(mesh, _)| mesh)
+    }
+
+    /// Loads an OBJ or FBX as the paintable mesh; also returns the texture sets `unwrap`
+    /// gave new UVs. `progress` hears how unwrapping goes ("Unwrapping Body (2/3): packing
+    /// 40%"), from other threads.
+    /// With `udims`, UVs laid out in UDIM tiles give one set per tile of each material.
+    pub fn load_file_with(path: &std::path::Path, unwrap: AutoUnwrap, udims: bool, progress: &(dyn Fn(String) + Sync)) -> Result<(Mesh, Vec<String>), String> {
+        let mut raw = crate::import::load(path)?;
+        let unwrapped = match unwrap {
+            AutoUnwrap::Off if !raw.missing_uvs.is_empty() => {
+                let names = raw.missing_uvs.join(", ");
+                return Err(format!(
+                    "These objects have no UVs: {names}. Unwrap the mesh before importing it, or turn on auto-unwrap in Preferences > General."
+                ));
+            }
+            AutoUnwrap::Off => Vec::new(),
+            mode => unwrap_raw(&mut raw, mode == AutoUnwrap::All, progress)?,
         };
-        let mut mesh = Mesh::from_parts(raw.name, raw.positions, raw.normals, uvs, raw.indices);
+        let mut mesh = Mesh::from_parts(raw.name, raw.positions, raw.normals, raw.uvs, raw.indices);
         // Triangle order survives tangent generation, so per-triangle data still lines up.
         mesh.tri_object = raw.tri_object;
         mesh.objects = raw.objects;
         mesh.tri_color = raw.tri_color;
-        mesh.split_by_material(&raw.tri_material, &raw.material_names);
-        Ok(mesh)
+        let tiles = if udims { mesh.split_into_udims() } else { None };
+        mesh.split_by_material_and_tile(&raw.tri_material, &raw.material_names, tiles.as_deref());
+        Ok((mesh, unwrapped))
+    }
+
+    /// Writes the mesh as OBJ (with an MTL naming one material per texture set), in its
+    /// original units and placement, so its UVs (unwrapped ones too) go with the exported
+    /// textures.
+    pub fn write_obj(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        let mtl = path.with_extension("mtl");
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+        let mut m = std::io::BufWriter::new(std::fs::File::create(&mtl).map_err(|e| e.to_string())?);
+        let io = |e: std::io::Error| e.to_string();
+        writeln!(f, "# Material Painter").map_err(io)?;
+        writeln!(f, "mtllib {}", mtl.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())).map_err(io)?;
+        writeln!(f, "o {}", self.name).map_err(io)?;
+        for v in &self.vertices {
+            let p = Vec3::from_array(v.pos) / self.scale + self.center;
+            writeln!(f, "v {} {} {}", p.x, p.y, p.z).map_err(io)?;
+        }
+        // UDIM sets' UVs go back to their tiles.
+        let mut tile = vec![(0.0f32, 0.0f32); self.vertices.len()];
+        for set in &self.sets {
+            if let Some(udim) = set.udim {
+                let offset = (((udim - 1001) % 10) as f32, ((udim - 1001) / 10) as f32);
+                for &i in &self.indices[set.index_range().start as usize..set.index_range().end as usize] {
+                    tile[i as usize] = offset;
+                }
+            }
+        }
+        for (v, (tu, tv)) in self.vertices.iter().zip(&tile) {
+            // Stored texture-down; OBJ is v-up.
+            writeln!(f, "vt {} {}", v.uv[0] + tu, 1.0 - v.uv[1] + tv).map_err(io)?;
+        }
+        for v in &self.vertices {
+            writeln!(f, "vn {} {} {}", v.normal[0], v.normal[1], v.normal[2]).map_err(io)?;
+        }
+        for set in &self.sets {
+            let name = set.name.replace(char::is_whitespace, "_");
+            writeln!(m, "newmtl {name}\nKd 0.8 0.8 0.8\n").map_err(io)?;
+            writeln!(f, "usemtl {name}").map_err(io)?;
+            for t in self.indices[set.index_range().start as usize..set.index_range().end as usize].chunks_exact(3) {
+                let [a, b, c] = [t[0] + 1, t[1] + 1, t[2] + 1];
+                writeln!(f, "f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}").map_err(io)?;
+            }
+        }
+        f.flush().map_err(io)?;
+        m.flush().map_err(io)
     }
 
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
+}
+
+/// Gives new UVs to the texture sets (materials) that need them: all of them, or those with
+/// an object that came without UVs. Triangle order is kept, so per-triangle data still lines
+/// up. Returns the names of the sets unwrapped.
+fn unwrap_raw(raw: &mut crate::import::RawMesh, all: bool, progress: &(dyn Fn(String) + Sync)) -> Result<Vec<String>, String> {
+    let tris = raw.indices.len() / 3;
+    let material = |t: usize| if raw.tri_material.len() == tris { raw.tri_material[t] } else { 0 };
+    let needs: Vec<bool> = (0..tris)
+        .map(|t| all || !raw.tri_object.get(t).and_then(|&o| raw.object_has_uv.get(o as usize)).copied().unwrap_or(false))
+        .collect();
+    let mut by_material: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+    for t in 0..tris {
+        by_material.entry(material(t)).or_default().push(t);
+    }
+    by_material.retain(|_, set| set.iter().any(|&t| needs[t]));
+    let count = by_material.len();
+    let mut done = Vec::new();
+    for (k, (m, set)) in by_material.into_iter().enumerate() {
+        let name = material_name(&raw.material_names, m);
+        // The set as a mesh of its own.
+        let mut local: HashMap<u32, u32> = HashMap::new();
+        let (mut global, mut positions, mut normals, mut indices) = (Vec::new(), Vec::new(), Vec::new(), Vec::with_capacity(set.len() * 3));
+        for &t in &set {
+            for &g in &raw.indices[t * 3..t * 3 + 3] {
+                let l = *local.entry(g).or_insert_with(|| {
+                    global.push(g);
+                    positions.push(raw.positions[g as usize]);
+                    if let Some(n) = &raw.normals {
+                        normals.push(n[g as usize]);
+                    }
+                    (global.len() - 1) as u32
+                });
+                indices.push(l);
+            }
+        }
+        let of = if count > 1 { format!(" ({}/{count})", k + 1) } else { String::new() };
+        let report = |step: &str, pct: u32| progress(format!("Unwrapping {name}{of}: {step} {pct}%"));
+        let flat = crate::unwrap::unwrap(&positions, raw.normals.as_ref().map(|_| normals.as_slice()), &indices, &report)
+            .map_err(|e| format!("Couldn't unwrap {name}: {e}"))?;
+        let base = raw.positions.len() as u32;
+        for (&x, &uv) in flat.xref.iter().zip(&flat.uvs) {
+            let g = global[x as usize] as usize;
+            raw.positions.push(raw.positions[g]);
+            if let Some(n) = &mut raw.normals {
+                n.push(n[g]);
+            }
+            raw.uvs.push(uv);
+        }
+        for (k, &t) in set.iter().enumerate() {
+            for c in 0..3 {
+                raw.indices[t * 3 + c] = base + flat.indices[k * 3 + c];
+            }
+        }
+        done.push(name);
+    }
+    // Drop the vertices only the replaced triangles used.
+    let mut remap = vec![u32::MAX; raw.positions.len()];
+    let mut kept = 0u32;
+    for i in raw.indices.iter_mut() {
+        if remap[*i as usize] == u32::MAX {
+            remap[*i as usize] = kept;
+            kept += 1;
+        }
+        *i = remap[*i as usize];
+    }
+    let mut order = vec![0usize; kept as usize];
+    for (old, &new) in remap.iter().enumerate() {
+        if new != u32::MAX {
+            order[new as usize] = old;
+        }
+    }
+    raw.positions = order.iter().map(|&o| raw.positions[o]).collect();
+    raw.uvs = order.iter().map(|&o| raw.uvs[o]).collect();
+    if let Some(n) = &mut raw.normals {
+        *n = order.iter().map(|&o| n[o]).collect();
+    }
+    Ok(done)
 }
 
 pub fn smooth_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
@@ -883,5 +1160,205 @@ pub(crate) mod set_tests {
         m.set_ranges(vec![("A".into(), 0..2), ("B".into(), 3..n)]);
         assert_eq!(m.sets.len(), 1);
         assert_eq!(m.sets[0].tris, 0..n);
+    }
+
+    /// A cube without UVs (material A) and a quad with UVs (material B), as OBJ + MTL.
+    fn write_mixed_obj(dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("mixed.mtl"), "newmtl A
+Kd 1 0 0
+newmtl B
+Kd 0 1 0
+").unwrap();
+        let mut obj = String::from("mtllib mixed.mtl
+o cube
+");
+        for i in 0..8 {
+            obj += &format!("v {} {} {}
+", i & 1, i >> 1 & 1, i >> 2 & 1);
+        }
+        obj += "usemtl A
+";
+        for q in [[1, 3, 4, 2], [5, 6, 8, 7], [1, 2, 6, 5], [3, 7, 8, 4], [1, 5, 7, 3], [2, 4, 8, 6]] {
+            obj += &format!("f {} {} {} {}
+", q[0], q[1], q[2], q[3]);
+        }
+        obj += "o quad
+v 2 0 0
+v 3 0 0
+v 3 1 0
+v 2 1 0
+vt 0 0
+vt 0.5 0
+vt 0.5 0.5
+vt 0 0.5
+usemtl B
+f 9/1 10/2 11/3 12/4
+";
+        let path = dir.join("mixed.obj");
+        std::fs::write(&path, obj).unwrap();
+        path
+    }
+
+    fn set_uvs(m: &Mesh, set: usize) -> Vec<Vec2> {
+        let r = m.sets[set].index_range();
+        m.indices[r.start as usize..r.end as usize].iter().map(|&i| Vec2::from_array(m.vertices[i as usize].uv)).collect()
+    }
+
+    #[test]
+    fn imports_unwrap_only_the_sets_without_uvs() {
+        let dir = std::env::temp_dir().join("mp_unwrap_test");
+        let path = write_mixed_obj(&dir);
+
+        let err = Mesh::load_file_with(&path, AutoUnwrap::Off, true, &|_| {}).err().unwrap();
+        assert!(err.contains("cube"), "{err}");
+
+        let (m, unwrapped) = Mesh::load_file_with(&path, AutoUnwrap::Missing, true, &|_| {}).unwrap();
+        assert_eq!(unwrapped, ["A"]);
+        assert_eq!(m.sets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["A", "B"]);
+        assert_eq!(m.triangle_count(), 14);
+        let a = set_uvs(&m, 0);
+        assert!(a.iter().all(|uv| (0.0..=1.0).contains(&uv.x) && (0.0..=1.0).contains(&uv.y)));
+        let area: f32 = a.chunks_exact(3).map(|t| (t[1] - t[0]).perp_dot(t[2] - t[0]).abs() * 0.5).sum();
+        assert!(area > 0.3 && area <= 1.0, "set A covers {area}");
+        // B keeps the file's UVs (texture-down).
+        let b = set_uvs(&m, 1);
+        assert!(b.iter().all(|uv| uv.x <= 0.5 && uv.y >= 0.5), "{b:?}");
+
+        let (all, unwrapped) = Mesh::load_file_with(&path, AutoUnwrap::All, true, &|_| {}).unwrap();
+        assert_eq!(unwrapped, ["A", "B"]);
+        assert!(set_uvs(&all, 1).iter().any(|uv| uv.x > 0.5));
+
+        // The exported OBJ carries the new UVs and the original placement.
+        let out = dir.join("exported.obj");
+        m.write_obj(&out).unwrap();
+        let (back, unwrapped) = Mesh::load_file_with(&out, AutoUnwrap::Off, true, &|_| {}).unwrap();
+        assert!(unwrapped.is_empty());
+        assert_eq!(back.triangle_count(), m.triangle_count());
+        assert_eq!(back.sets.len(), 2);
+        assert!((back.center - m.center).length() < 1e-4 && (back.scale - m.scale).abs() < 1e-4);
+        for (x, y) in set_uvs(&back, 0).iter().zip(&a) {
+            assert!((*x - *y).length() < 1e-5);
+        }
+    }
+
+    /// Quads at OBJ UVs (u, v-up) offsets, one triangle pair each, all material "Skin"
+    /// unless `second` names the last quad's material.
+    fn write_tiled_obj(path: &std::path::Path, quads: &[(f32, f32)], second: Option<&str>) {
+        let mtl = path.with_extension("mtl");
+        let mut s = format!("mtllib {}
+o tiled
+", mtl.file_name().unwrap().to_string_lossy());
+        for (k, &(u, v)) in quads.iter().enumerate() {
+            let x = k as f32 * 2.0;
+            s += &format!("v {x} 0 0
+v {} 0 0
+v {} 1 0
+v {x} 1 0
+", x + 1.0, x + 1.0);
+            s += &format!("vt {} {}
+vt {} {}
+vt {} {}
+vt {} {}
+", u + 0.1, v + 0.1, u + 0.9, v + 0.1, u + 0.9, v + 0.9, u + 0.1, v + 0.9);
+        }
+        for k in 0..quads.len() {
+            let mat = if k + 1 == quads.len() { second.unwrap_or("Skin") } else { "Skin" };
+            let i = k * 4 + 1;
+            s += &format!("usemtl {mat}
+f {i}/{i} {}/{} {}/{}
+f {i}/{i} {}/{} {}/{}
+", i + 1, i + 1, i + 2, i + 2, i + 2, i + 2, i + 3, i + 3);
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, s).unwrap();
+        std::fs::write(mtl, "newmtl Skin
+Kd 1 1 1
+newmtl Eyes
+Kd 1 1 1
+").unwrap();
+    }
+
+    #[test]
+    fn udim_tiles_become_texture_sets() {
+        let dir = std::env::temp_dir().join("mp_udim_test");
+        let path = dir.join("tiled.obj");
+        write_tiled_obj(&path, &[(0.0, 0.0), (1.0, 0.0), (2.0, 1.0)], None);
+        let (m, _) = Mesh::load_file_with(&path, AutoUnwrap::Missing, true, &|_| {}).unwrap();
+        assert_eq!(m.sets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Skin.1001", "Skin.1002", "Skin.1013"]);
+        assert_eq!(m.sets.iter().map(|s| s.udim).collect::<Vec<_>>(), [Some(1001), Some(1002), Some(1013)]);
+        assert!(m.sets.iter().all(|s| s.base_name() == "Skin"));
+        for k in 0..3 {
+            assert!(set_uvs(&m, k).iter().all(|uv| (0.05..0.95).contains(&uv.x) && (0.05..0.95).contains(&uv.y)), "set {k}: {:?}", set_uvs(&m, k));
+        }
+        // Turned off, the file's UVs stay as they are, in one set.
+        let (off, _) = Mesh::load_file_with(&path, AutoUnwrap::Missing, false, &|_| {}).unwrap();
+        assert_eq!(off.sets.len(), 1);
+        assert!(off.sets[0].udim.is_none());
+        // The exported OBJ puts the tiles back.
+        let out = dir.join("tiled_out.obj");
+        m.write_obj(&out).unwrap();
+        let (back, _) = Mesh::load_file_with(&out, AutoUnwrap::Off, false, &|_| {}).unwrap();
+        let original: Vec<Vec2> = off.vertices.iter().map(|v| Vec2::from(v.uv)).collect();
+        let exported: Vec<Vec2> = back.vertices.iter().map(|v| Vec2::from(v.uv)).collect();
+        for uv in &exported {
+            assert!(original.iter().any(|o| (*o - *uv).length() < 1e-5), "{uv} isn't in the file");
+        }
+    }
+
+    #[test]
+    fn udim_tiles_split_by_material_too() {
+        let path = std::env::temp_dir().join("mp_udim_test").join("two_materials.obj");
+        write_tiled_obj(&path, &[(0.0, 0.0), (1.0, 0.0), (0.0, 0.0)], Some("Eyes"));
+        let (m, _) = Mesh::load_file_with(&path, AutoUnwrap::Missing, true, &|_| {}).unwrap();
+        let mut names: Vec<&str> = m.sets.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Eyes.1001", "Skin.1001", "Skin.1002"]);
+    }
+
+    #[test]
+    fn repeating_uvs_are_not_udims() {
+        // One quad tiled 3 times across: its triangles cross tile borders.
+        let mut m = Mesh::from_parts(
+            "floor".into(),
+            vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0)],
+            None,
+            vec![Vec2::new(0.0, 1.0), Vec2::new(3.0, 1.0), Vec2::new(3.0, -2.0)],
+            vec![0, 1, 2],
+        );
+        assert!(m.split_into_udims().is_none());
+        // A 0..1 layout isn't either.
+        let mut m = Mesh::from_parts("a".into(), vec![Vec3::ZERO, Vec3::X, Vec3::Y], None, vec![Vec2::ZERO, Vec2::X, Vec2::Y], vec![0, 1, 2]);
+        assert!(m.split_into_udims().is_none());
+    }
+
+    #[test]
+    fn a_vertex_on_a_tile_border_is_split() {
+        // Two triangles sharing vertices 1 and 2 at u = 1: one in tile 1001, one in 1002.
+        let p = vec![Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::new(2.0, 0.0, 0.0)];
+        // Texture-down v: OBJ v-up 0.1..0.9 is 0.9..0.1.
+        let uv = vec![Vec2::new(0.2, 0.9), Vec2::new(1.0, 0.9), Vec2::new(1.0, 0.1), Vec2::new(1.8, 0.9)];
+        let mut m = Mesh::from_parts("border".into(), p, None, uv, vec![0, 1, 2, 1, 3, 2]);
+        let before = m.vertices.len();
+        let tiles = m.split_into_udims().unwrap();
+        assert_eq!(tiles, [1001, 1002]);
+        assert!(m.vertices.len() > before, "border vertices copied");
+        let uv = |t: usize, c: usize| Vec2::from(m.vertices[m.indices[t * 3 + c] as usize].uv);
+        // In 1001 the border is at u = 1; in 1002 the same corner is at u = 0.
+        assert!((uv(0, 1).x - 1.0).abs() < 1e-6);
+        assert!(uv(1, 0).x.abs() < 1e-6 && (uv(1, 1).x - 0.8).abs() < 1e-6);
+    }
+
+    /// Times unwrapping real files: `MP_UNWRAP="a.fbx;b.obj" cargo test --release unwrap_files -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn unwrap_files() {
+        for path in std::env::var("MP_UNWRAP").unwrap_or_default().split(';').filter(|p| !p.is_empty()) {
+            let t = std::time::Instant::now();
+            match Mesh::load_file_with(std::path::Path::new(path), AutoUnwrap::All, true, &|_| {}) {
+                Ok((m, sets)) => println!("{path}: {} triangles, {} sets unwrapped in {:.2}s", m.triangle_count(), sets.len(), t.elapsed().as_secs_f32()),
+                Err(e) => println!("{path}: {e}"),
+            }
+        }
     }
 }

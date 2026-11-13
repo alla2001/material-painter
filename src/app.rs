@@ -37,6 +37,10 @@ mod library_ui;
 mod path_tool;
 mod bake_live;
 mod spp_open;
+mod spp_replay;
+mod space_nav;
+mod mesh_import;
+mod updates;
 mod preview_shader;
 mod smart_io;
 mod welcome;
@@ -373,6 +377,8 @@ enum Action {
     MoveTo { from: usize, drop: Drop },
     /// Loads (or with `None` clears) the image on a fill layer channel.
     SetFillImage { idx: usize, ch: usize, path: Option<std::path::PathBuf> },
+    /// Which part of the file the fill layer's opacity image reads.
+    SetImageSource { idx: usize, source: crate::engine::ImageSource },
     /// A shelf item dropped at a spot in the layer stack.
     ShelfDrop { item: ShelfItem, at: usize, parent: Option<u64> },
     /// A fill layer driven by a new material graph.
@@ -476,12 +482,16 @@ pub struct PainterApp {
     bake_preview: bake_live::LivePreview,
     custom_ui: bake_live::CustomUi,
     spp: spp_open::SppOpen,
+    mesh_import: mesh_import::MeshImport,
+    updates: updates::Updates,
     preview: preview_shader::PreviewShader,
     /// A crash report the last run left, shown once.
     crash_report: Option<std::path::PathBuf>,
     frame_ms: f32,
     ppp: f32,
     mcp: Option<crate::mcp::McpServer>,
+    /// The 3D mouse, when one is plugged in.
+    space: space_nav::SpaceNav,
     /// MCP calls answered when the running bake completes.
     mcp_bake_waiters: Vec<mpsc::Sender<crate::mcp::ToolResult>>,
     /// The open project file, if it has been saved or opened.
@@ -1432,11 +1442,14 @@ impl PainterApp {
             bake_preview: Default::default(),
             custom_ui: Default::default(),
             spp: Default::default(),
+            mesh_import: Default::default(),
+            updates: Default::default(),
             preview: Default::default(),
             crash_report: crate::crash::take_report(),
             frame_ms: 0.0,
             ppp: cc.egui_ctx.pixels_per_point(),
             mcp: None,
+            space: Default::default(),
             mcp_bake_waiters: Vec::new(),
             mcp_env_waiters: Vec::new(),
             project_path: None,
@@ -1471,6 +1484,9 @@ impl PainterApp {
             line_anchor: None,
         };
         app.apply_startup_preferences(ctx);
+        if app.prefs.check_updates {
+            app.check_for_updates(ctx, false);
+        }
         match crate::mcp::McpServer::start(&cc.egui_ctx, app.prefs.mcp_port, app.prefs.mcp_on_start) {
             Ok(server) => app.mcp = Some(server),
             Err(e) => app.status = e,
@@ -1694,10 +1710,7 @@ impl PainterApp {
                 Action::ChangeMesh(p) => self.load_mesh(p.build(), ctx),
                 Action::ImportMesh => {
                     if let Some(path) = rfd::FileDialog::new().add_filter("Mesh (FBX, OBJ)", &crate::import::EXTENSIONS).pick_file() {
-                        match Mesh::load_file(&path) {
-                            Ok(mesh) => self.load_mesh(mesh, ctx),
-                            Err(e) => self.status = e,
-                        }
+                        self.start_mesh_import(path, ctx);
                     }
                 }
                 Action::Undo => {
@@ -1862,6 +1875,11 @@ impl PainterApp {
                         }
                     }
                 },
+                Action::SetImageSource { idx, source } => {
+                    if let Err(e) = self.engine.set_image_source(idx, source, &mut self.undo) {
+                        self.status = e;
+                    }
+                }
                 Action::MoveTo { from, drop } => {
                     if let Some(i) = self.engine.move_to(from, drop, &mut self.undo) {
                         self.selected = i;
@@ -2007,7 +2025,8 @@ impl PainterApp {
             match c {
                 0 => self.pending.push(Action::SaveThen(Box::new(action))),
                 1 => self.pending.push(Action::Confirmed(Box::new(action))),
-                _ => {}
+                // "Restart now" for an update waits for the next close.
+                _ => crate::update::set_relaunch(false),
             }
         }
     }
@@ -2194,8 +2213,18 @@ impl PainterApp {
                         }
                     }
                 });
-                if ui.button(theme::with_icon(icons::CUBE, "Import mesh (FBX, OBJ)…")).clicked() {
+                let import = ui
+                    .add_enabled(!self.mesh_import_busy(), egui::Button::new(theme::with_icon(icons::CUBE, "Import mesh (FBX, OBJ)…")))
+                    .on_hover_text("Objects without UVs are unwrapped automatically (Preferences > General > Auto-unwrap).");
+                if import.clicked() {
                     self.pending.push(Action::ImportMesh);
+                    ui.close();
+                }
+                let export = ui
+                    .button(theme::with_icon(icons::CUBE, "Export mesh (OBJ)…"))
+                    .on_hover_text("The model with its UVs, unwrapped ones included, to use with the exported textures.");
+                if export.clicked() {
+                    self.export_mesh();
                     ui.close();
                 }
                 let spp = ui
@@ -2283,6 +2312,10 @@ impl PainterApp {
             ui.menu_button("Help", |ui| {
                 if ui.button(theme::with_icon(icons::INFO, "Controls")).clicked() {
                     self.show_help = true;
+                    ui.close();
+                }
+                if ui.button(theme::with_icon(icons::DOWNLOAD_SIMPLE, "Check for updates…")).clicked() {
+                    self.check_for_updates(ui.ctx(), true);
                     ui.close();
                 }
                 if ui.button("Source code and releases").clicked() {
@@ -2604,6 +2637,7 @@ impl PainterApp {
                     .color(theme::TEXT_DIM)
                     .small(),
                 );
+                self.update_status_button(ui);
                 if let Some(server) = &self.mcp {
                     if server.enabled.load(std::sync::atomic::Ordering::Relaxed) {
                         ui.label(egui::RichText::new(format!("MCP :{}", server.port)).color(theme::ACCENT).small())
@@ -3675,6 +3709,9 @@ impl PainterApp {
                 if is_fill {
                     let names: [Option<String>; crate::engine::CHANNELS] =
                         std::array::from_fn(|i| self.engine.layers[idx].images[i].as_ref().map(|im| im.name.clone()));
+                    // Only a file can be read again; graph outputs have none.
+                    let opacity_source =
+                        self.engine.layers[idx].images[crate::engine::OPACITY].as_ref().filter(|im| !im.encoded.is_empty()).map(|im| im.source);
                     let graph_name = match &self.engine.layers[idx].content {
                         Content::Fill(f) => f.graph.map(|g| self.graphs.doc(g).map_or("(missing)".to_string(), |d| d.graph.name.clone())),
                         _ => None,
@@ -3750,6 +3787,18 @@ impl PainterApp {
                             }
                             if let Some(ShelfItem::Texture(texture)) = dnd_release::<ShelfItem>(&drop).as_deref() {
                                 self.pending.push(Action::TextureToChannel { texture: *texture, ch });
+                            }
+                            // Opacity is one value: pick the part of the image it reads.
+                            if let (crate::engine::OPACITY, Some(current)) = (ch, opacity_source) {
+                                labeled(ui, "Opacity from", |ui| {
+                                    egui::ComboBox::from_id_salt("opacity_source").selected_text(current.name()).show_ui(ui, |ui| {
+                                        for source in crate::engine::ImageSource::ALL {
+                                            if ui.selectable_label(current == source, source.name()).on_hover_text(source.tip()).clicked() {
+                                                self.pending.push(Action::SetImageSource { idx, source });
+                                            }
+                                        }
+                                    });
+                                });
                             }
                         }
                         if names[crate::engine::NORMAL].is_some() {
@@ -4922,7 +4971,7 @@ impl PainterApp {
 
     /// Shows the faces the fill tool would fill under the cursor.
     fn update_poly_highlight(&mut self) {
-        let hover = self.poly.frame_hover.take().filter(|_| self.tool == Tool::PolyFill);
+        let hover = self.poly.frame_hover.take().filter(|_| self.tool == Tool::PolyFill && self.paint_blocked().is_none());
         let erase = if self.stroke.is_some() { self.poly.stroke_erase } else { self.poly.erase };
         let mode = self.poly.mode;
         let want = hover.map(|(tri, at)| PolyShown {
@@ -4962,6 +5011,10 @@ impl PainterApp {
     /// Starts a stroke on the current target (layer content, mask or bake
     /// fix), or says in the status bar why it can't.
     fn begin_stroke_on_target(&mut self, kind: ViewKind, at: Vec2, erase: bool) -> bool {
+        if let Some(why) = self.paint_blocked() {
+            self.status = why;
+            return false;
+        }
         let idx = self.selected;
         if let StrokeTarget::BakeFix(_) = self.target {
             if self.engine.begin_stroke(0, self.target, [false; crate::engine::CHANNELS], erase) {
@@ -4991,6 +5044,19 @@ impl PainterApp {
             };
             false
         }
+    }
+
+    /// Why painting is off, if it is: views that don't show the paint (baked maps, world
+    /// normals and the like) would let strokes land unseen. Fixing a baked map paints in
+    /// that map's view, so it stays allowed.
+    fn paint_blocked(&self) -> Option<String> {
+        if matches!(self.target, StrokeTarget::BakeFix(_)) || ViewMode::CHANNELS.contains(&self.view.mode) {
+            return None;
+        }
+        Some(format!(
+            "Painting is off in the {} view, where the paint wouldn't show. Switch the view to Material or a channel to paint.",
+            self.mode_name(self.view.mode)
+        ))
     }
 
     /// Eyedropper: copies the final color, roughness and metallic under the
@@ -5160,6 +5226,12 @@ impl PainterApp {
             _ => {}
         }
 
+        // A pen's side button pans like the middle mouse button: winit drops it (see
+        // `crate::pen`), so it's read here. Either one held makes the pen navigate, not paint.
+        let pen_pan = crate::pen::barrel_down() && hover.is_some_and(|p| rect.contains(p)) && resp.hovered();
+        let middle_drag = resp.dragged_by(B::Middle) || pen_pan;
+        let navigating = pen_pan || ui.input(|i| i.pointer.middle_down());
+
         // Navigation.
         match kind {
             ViewKind::V3d => {
@@ -5170,7 +5242,7 @@ impl PainterApp {
                     self.cam.yaw -= delta.x * k;
                     self.cam.pitch = (self.cam.pitch + delta.y * k).clamp(-1.55, 1.55);
                 }
-                if resp.dragged_by(B::Middle) {
+                if middle_drag {
                     let (right, up) = self.cam.basis();
                     let k = self.cam.dist * 0.0016;
                     self.cam.target += (-right * delta.x + up * delta.y) * k;
@@ -5199,7 +5271,7 @@ impl PainterApp {
                 }
             }
             ViewKind::V2d => {
-                if resp.dragged_by(B::Middle) || resp.dragged_by(B::Secondary) || (resp.dragged_by(B::Primary) && mods.alt) {
+                if middle_drag || resp.dragged_by(B::Secondary) || (resp.dragged_by(B::Primary) && mods.alt) {
                     self.cam2d.pan += Vec2::new(delta.x, delta.y) * ppp;
                 }
                 if resp.hovered() && scroll != 0.0 {
@@ -5220,6 +5292,9 @@ impl PainterApp {
         // The bake window's gizmo (direction arrow, point marker) comes first.
         if kind == ViewKind::V3d {
             self.custom_ui.view_rect = Some(rect);
+        }
+        if navigating && self.stroke.is_none() {
+            return;
         }
         if kind == ViewKind::V3d && !mods.alt {
             let cursor = hover.filter(|p| rect.contains(*p)).map(local);
@@ -5438,7 +5513,15 @@ impl PainterApp {
         // Brush cursor.
         let alt = ui.input(|i| i.modifiers.alt);
         if let Some(p) = resp.hover_pos() {
-            if self.tool == Tool::PolyFill && !alt {
+            if self.tool != Tool::Picker && !alt && self.paint_blocked().is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+                let note = format!("No painting in {}", self.mode_name(self.view.mode));
+                let at = p + vec2(14.0, 14.0);
+                let font = egui::FontId::proportional(11.5);
+                let galley = painter.layout_no_wrap(note, font, Color32::WHITE);
+                painter.rect_filled(Rect::from_min_size(at, galley.size()).expand(4.0), 3.0, Color32::from_black_alpha(180));
+                painter.galley(at, galley, Color32::WHITE);
+            } else if self.tool == Tool::PolyFill && !alt {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             } else if !alt {
                 let r = self.brush.size * 0.5;
@@ -5551,6 +5634,7 @@ impl PainterApp {
                     ("Shift + RMB", "Rotate environment"),
                     ("Ctrl + RMB", "Brush size (→) / hardness (↑)"),
                     ("Alt + double-click", "Set orbit center on the mesh"),
+                    ("3D mouse", "Twist / tilt: turn · push: move · pull: zoom · side buttons: frame"),
                     ("[  ]", "Brush size"),
                     ("Shift + click", "Straight line from the last stroke"),
                     ("Ctrl+G", "Material Designer (the selected layer's graph)"),
@@ -5588,10 +5672,13 @@ impl eframe::App for PainterApp {
         self.undo.update();
         self.poll_bake(&ctx);
         self.poll_spp_open(&ctx);
+        self.poll_mesh_import(&ctx);
         self.update_preview(&ctx);
         self.poll_env();
         self.poll_hdri_thumbs(&ctx);
         self.poll_library(&ctx);
+        self.poll_updates();
+        self.space_nav(&ctx);
         // Closing the window with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.is_modified() {
@@ -5672,6 +5759,7 @@ impl eframe::App for PainterApp {
         self.spp_report_window(&ctx);
         self.help_window(&ctx);
         self.about_window(&ctx);
+        self.update_window(&ctx);
         self.crash_window(&ctx);
         self.welcome_window(&ctx);
         self.library_window(&ctx);

@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 use eframe::egui;
 use serde_json::{Value, json};
 
-const USER_AGENT: &str = concat!("MaterialPainter/", env!("CARGO_PKG_VERSION"), " (https://github.com/alla2001/material-painter)");
+pub(crate) const USER_AGENT: &str = concat!("MaterialPainter/", env!("CARGO_PKG_VERSION"), " (https://github.com/alla2001/material-painter)");
 /// The community library: a GitHub repository with an `index.json`.
 pub const COMMUNITY_REPO: &str = "alla2001/material-painter-community";
 const COMMUNITY_RAW: &str = "https://raw.githubusercontent.com/alla2001/material-painter-community/main/";

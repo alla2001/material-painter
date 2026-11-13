@@ -34,6 +34,21 @@ maps, build materials in a node graph and write your own node shaders.
   tracer and exports as the base color's alpha; emission glows with bloom;
   normal-map images on fills add detail, projected in UV or tri-planar, and
   merge with the baked normal on export.
+- **3D mouse**: navigate the 3D view with a 3Dconnexion SpaceMouse (or
+  another six-axis controller), read straight from the device: no vendor
+  SDK needed. Speed and direction are in Preferences > Viewport. On Linux the
+  device needs read access to its `/dev/hidraw` node (a udev rule).
+- **Auto-unwrap**: meshes without UVs are unwrapped on import (xatlas),
+  one non-overlapping layout per texture set, or every set when you choose
+  to replace the file's UVs (Preferences > General). File > Export mesh saves
+  the model with its new UVs for use with the exported textures.
+- **UDIM tiles**: a mesh laid out across UV tiles (1001, 1002, …) gets a
+  texture set per tile of each material, baked and painted on its own, and
+  exported as `Name_BaseColor.1001.png` (or wherever `$udim` sits in the file
+  name), which Unreal, Maya, Blender and Houdini read as UDIMs. File > Export
+  mesh puts the UVs back in their tiles. A stroke stays within the tile being
+  edited. Off in Preferences > General for meshes that move islands out of 0..1
+  on purpose.
 - **Texture sets**: a mesh with several materials gets one texture set per
   material, each with its own layers, size, baked maps and exported files.
   Hide a set's part of the mesh, or highlight it to see which part it is.
@@ -68,10 +83,11 @@ maps, build materials in a node graph and write your own node shaders.
   image files with a `meta.json`, so nothing is locked into Material Painter.
 - **Open Substance 3D Painter projects** (`.spp`): the model and every
   texture set, with the final look of base color, roughness, metallic,
-  height, opacity, emission and painted normal details, and as much of each layer stack as maps onto Material Painter's
-  layers. Procedural materials, brush
-  strokes and Painter-only channels don't come across; the import report
-  says exactly what did. Details and limits:
+  height, opacity, emission and painted normal details, and each layer stack
+  rebuilt: fills with their images, paint layers and painted masks replayed
+  from Painter's recorded strokes and polygon fills, smart masks as the
+  closest ones here. Procedural (Substance) materials and filters don't come
+  across; the import report says exactly what did. Details and limits:
   [docs/substance-painter-import.md](docs/substance-painter-import.md).
 - **Docking workspaces**, path-traced preview, HDRI lighting, and an MCP
   server so AI agents can drive the app (off by default).
@@ -90,6 +106,14 @@ all free; donations on [Ko-fi](https://ko-fi.com/allaeddinerakik) fund developme
 - **Windows**: the installer, or the zip to unpack and run.
 - **Linux**: the tarball. Unpack it, run `./material-painter`, and
   optionally `./install.sh` to add it to your app menu.
+
+**Updates** come from inside the app (from 0.1.7 on): at start it asks GitHub
+whether a newer release is out (turn that off in Preferences > General, or check
+by hand with Help > Check for updates). Choose *Download and install* and the
+new version goes in when you close the app: the installer updates an installed
+copy, an unpacked zip or tarball gets its files replaced, and the macOS app
+bundle is swapped. Only packages signed by the release workflow install, so a
+file that didn't come from it is refused. Nothing about you or your work is sent.
 
 **Requirements**: 64-bit Windows 10 or 11, or Linux (x64, glibc 2.35 or newer:
 Ubuntu 22.04, Fedora 36, Debian 12 and later), and a GPU with DirectX 12 or

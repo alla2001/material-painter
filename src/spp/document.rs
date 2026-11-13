@@ -578,6 +578,9 @@ pub struct BrushInfo {
     /// The set tweaks of a Substance-graph stencil (`switch_stencil`, `Switch_Alpha`... pick the
     /// sheet's image); empty for a bitmap stencil.
     pub stencil_tweaks: Vec<(String, Vec<f32>)>,
+    /// What the brush paints, per channel (`sourceColor`: uniform colors and values; base color
+    /// linear, as fills keep it).
+    pub sources: Vec<SourceInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -806,6 +809,7 @@ fn brush_of(a: &Obj) -> Option<BrushInfo> {
             Some((url, m))
         }),
         stencil_tweaks: a.obj("sourceStencil").filter(|s| s.class == "DataSourceProcedural").and_then(|s| s.obj("procedural")).and_then(graph_of).map(|g| g.tweaks).unwrap_or_default(),
+        sources: a.list("sourceColor").iter().filter_map(source_of).collect(),
     })
 }
 
@@ -1028,5 +1032,136 @@ mod tests {
         assert_eq!(layer_of(&only).mesh_filter, Some((false, vec!["2.002_low".to_string()])));
         let all = obj("DataLayerColor", vec![("geometryMaskType", Val::Int(0)), ("enabledMeshDefault", Val::Int(255))]);
         assert_eq!(layer_of(&all).mesh_filter, None);
+    }
+}
+
+#[cfg(test)]
+mod real_probe {
+    //! What real projects hold (`MP_SPP=a.spp;b.spp`): action kinds, sources, tips, and the
+    //! fields of the first paint action, to build the import against.
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn shape(o: &Obj, depth: usize, out: &mut String) {
+        for (n, v) in &o.fields {
+            let pad = "  ".repeat(depth);
+            match v {
+                Val::Obj(Some(b)) => {
+                    out.push_str(&format!("{pad}{n}: {}\n", b.class));
+                    if depth < 4 {
+                        shape(b, depth + 1, out);
+                    }
+                }
+                Val::List(l) => {
+                    out.push_str(&format!("{pad}{n}: [{}] {}\n", l.len(), l.first().map_or("", |o| o.class.as_str())));
+                    if let Some(f) = l.first().filter(|_| depth < 4) {
+                        shape(f, depth + 1, out);
+                    }
+                }
+                Val::Float(f) => out.push_str(&format!("{pad}{n}: {:?}\n", &f[..f.len().min(4)])),
+                other => out.push_str(&format!("{pad}{n}: {:?}\n", other)),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn spp_real_probe() {
+        let Ok(paths) = std::env::var("MP_SPP") else { return };
+        for p in paths.split(';') {
+            let mut f = crate::spp::SppFile::open(std::path::Path::new(p)).expect("opens");
+            let info = f.project().expect("document");
+            let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+            let mut first_paint = None;
+            for set in &info.texture_sets {
+                walk_layers(&set.layers, &mut |l, _| {
+                    for (a, mask) in l.content.iter().map(|a| (a, false)).chain(l.mask.iter().map(|a| (a, true))) {
+                        let where_ = if mask { "mask" } else { "content" };
+                        let k = match &a.kind {
+                            ActionKind::Fill { sources, projection } => {
+                                for s in sources {
+                                    let n = match s {
+                                        SourceInfo::Uniform { .. } => "uniform".to_string(),
+                                        SourceInfo::Bitmap { .. } => "bitmap".to_string(),
+                                        SourceInfo::Procedural { graph, .. } => format!("proc {}", graph.name()),
+                                        SourceInfo::Reference { .. } => "reference".to_string(),
+                                    };
+                                    *kinds.entry(format!("{where_} fill source {n}")).or_default() += 1;
+                                }
+                                format!("fill proj={projection} uv={:?}", a.uv.map(|u| u.tiling))
+                            }
+                            ActionKind::Filter { graph } => format!("filter {}", graph.name()),
+                            ActionKind::Levels(_) => "levels".into(),
+                            ActionKind::Paint { strokes, brush, .. } | ActionKind::Eraser { strokes, brush, .. } => {
+                                let er = matches!(a.kind, ActionKind::Eraser { .. });
+                                for s in strokes {
+                                    *kinds.entry(format!("{where_} stroke uv_space={} dup={} pressure={}", s.uv_space, s.duplicate.is_some(), !s.pressure.is_empty())).or_default() += 1;
+                                }
+                                if let Some(b) = brush {
+                                    *kinds.entry(format!("{where_} brush tip='{}' space={} align={} stencil={}", b.tip, b.size_space, b.alignment, b.stencil.is_some())).or_default() += 1;
+                                }
+                                if first_paint.is_none() && !mask && !er {
+                                    first_paint = Some((l.name.clone(), a.label.clone()));
+                                }
+                                if er { "eraser".into() } else { "paint".into() }
+                            }
+                            ActionKind::Decal { hits } => format!("decal granularity={:?} uv={:?}", hits.iter().map(|h| h.granularity).collect::<std::collections::BTreeSet<_>>(), hits.iter().any(|h| h.uv_space)),
+                            ActionKind::Anchor { .. } => "anchor".into(),
+                            ActionKind::Other(c) => format!("other {c}"),
+                        };
+                        *kinds.entry(format!("{where_} {k}")).or_default() += 1;
+                    }
+                }, 0);
+                walk_layers(&set.layers, &mut |l, _| {
+                    if l.mask.is_empty() { return; }
+                    let seq: Vec<String> = l.mask.iter().filter(|a| a.enabled).map(|a| match &a.kind {
+                        ActionKind::Fill { sources, .. } => sources.iter().map(|s| match s {
+                            SourceInfo::Uniform { color, .. } => format!("U{}", color[0]),
+                            SourceInfo::Bitmap { .. } => "B".into(),
+                            SourceInfo::Procedural { graph, .. } => format!("G:{}", graph.name()),
+                            SourceInfo::Reference { .. } => "R".into(),
+                        }).collect::<Vec<_>>().join("+"),
+                        ActionKind::Paint { brush, .. } => format!("P{}", brush.as_ref().map_or(1.0, |b| b.value)),
+                        ActionKind::Eraser { .. } => "E".into(),
+                        ActionKind::Decal { hits } => format!("D{}", hits.first().map_or(1.0, |h| h.value)),
+                        ActionKind::Levels(_) => "L".into(),
+                        ActionKind::Filter { graph } => format!("F:{}", graph.name()),
+                        ActionKind::Anchor { .. } => "A".into(),
+                        ActionKind::Other(_) => "?".into(),
+                    }).collect();
+                    let mut dedup: Vec<String> = Vec::new();
+                    for x in seq { if dedup.last() != Some(&x) { dedup.push(x); } }
+                    *kinds.entry(format!("SEQ init={} {}", l.mask_initial_white as u8, dedup.join(" "))).or_default() += 1;
+                }, 0);
+                println!("{p}: set '{}' channels {:?}", set.name, set.channels.iter().map(|c| (c.bits, c.name.clone())).collect::<Vec<_>>());
+            }
+            for (k, n) in &kinds {
+                println!("  {n:5} {k}");
+            }
+            // The raw fields of the first paint action.
+            if std::env::var("MP_SPP_RAW").is_ok() {
+                let root = parse(&f.bytes_for_probe("paint/document.bin")).unwrap();
+                fn find<'a>(o: &'a Obj, class: &str) -> Option<&'a Obj> {
+                    if o.class == class {
+                        return Some(o);
+                    }
+                    for (_, v) in &o.fields {
+                        match v {
+                            Val::Obj(Some(b)) => if let Some(r) = find(b, class) { return Some(r) },
+                            Val::List(l) => for c in l { if let Some(r) = find(c, class) { return Some(r) } },
+                            _ => {}
+                        }
+                    }
+                    None
+                }
+                for class in ["DataActionPaint", "DataActionFill", "DataLayerPaint", "DataLayerColor"] {
+                    if let Some(a) = find(&root, class) {
+                        let mut s = String::new();
+                        shape(a, 1, &mut s);
+                        println!("--- {class} ({first_paint:?})\n{s}");
+                    }
+                }
+            }
+        }
     }
 }

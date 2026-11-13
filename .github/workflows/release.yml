@@ -41,6 +41,12 @@ jobs:
           choco install innosetup --no-progress -y
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.package.outputs.version }}" installer\material-painter.iss
           if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+      # Signatures for the in-app updater, which installs only signed packages.
+      - name: Sign for the updater
+        shell: bash
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: cargo run --release --locked --manifest-path tools/update-sign/Cargo.toml -- sign dist/MaterialPainter-*-windows-x64.zip dist/MaterialPainter-*-setup.exe
       - name: Draft release
         uses: softprops/action-gh-release@v2
         with:
@@ -49,7 +55,9 @@ jobs:
           generate_release_notes: true
           files: |
             dist/MaterialPainter-*-windows-x64.zip
+            dist/MaterialPainter-*-windows-x64.zip.sig
             dist/MaterialPainter-*-setup.exe
+            dist/MaterialPainter-*-setup.exe.sig
 
   linux:
     if: github.event_name == 'push' || contains(inputs.platforms, 'linux')
@@ -69,12 +77,20 @@ jobs:
         run: cargo test --locked
       - name: Build and package
         run: ./scripts/package.sh
+      # Signatures for the in-app updater, which installs only signed packages.
+      - name: Sign for the updater
+        shell: bash
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: cargo run --release --locked --manifest-path tools/update-sign/Cargo.toml -- sign dist/MaterialPainter-*-linux-x64.tar.gz
       - name: Draft release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: dist/MaterialPainter-*-linux-x64.tar.gz
+          files: |
+            dist/MaterialPainter-*-linux-x64.tar.gz
+            dist/MaterialPainter-*-linux-x64.tar.gz.sig
 
   macos:
     if: github.event_name == 'push' || contains(inputs.platforms, 'macos')
@@ -91,9 +107,17 @@ jobs:
         run: cargo test --locked
       - name: Build and package
         run: ./scripts/package-macos.sh
+      # Signatures for the in-app updater, which installs only signed packages.
+      - name: Sign for the updater
+        shell: bash
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: cargo run --release --locked --manifest-path tools/update-sign/Cargo.toml -- sign dist/MaterialPainter-*-macos-universal.dmg
       - name: Draft release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: dist/MaterialPainter-*-macos-universal.dmg
+          files: |
+            dist/MaterialPainter-*-macos-universal.dmg
+            dist/MaterialPainter-*-macos-universal.dmg.sig

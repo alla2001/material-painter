@@ -368,6 +368,17 @@ impl PainterApp {
         self.load_mesh(mesh, ctx);
     }
 
+    /// Each set's UDIM tile (offscreen tests).
+    pub(crate) fn test_udims(&self) -> Vec<Option<u32>> {
+        self.mesh.sets.iter().map(|s| s.udim).collect()
+    }
+
+    /// Exports every set with the first template into `folder` (offscreen tests).
+    pub(crate) fn test_export(&mut self, folder: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+        let settings = crate::export::Settings { folder: folder.to_path_buf(), ..self.export_settings() };
+        self.export_now(0, &settings)
+    }
+
     /// Changes with every recorded edit (offscreen tests).
     pub(crate) fn test_undo_serial(&self) -> u64 {
         self.undo.state_serial()

@@ -10,8 +10,8 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 
 pub const NEAR: f32 = 0.02;
 pub const FAR: f32 = 100.0;
-const MSAA: u32 = 4;
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub(crate) const MSAA: u32 = 4;
+pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// What the viewports display. Discriminants match `shade()` in view.wgsl;
