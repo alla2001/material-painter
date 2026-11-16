@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "material_painter"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bytemuck",
  "cc",

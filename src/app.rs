@@ -35,6 +35,8 @@ mod graph_ui;
 mod shader_ui;
 mod library_ui;
 mod path_tool;
+mod clone_tool;
+mod stencil;
 mod bake_live;
 mod spp_open;
 mod spp_replay;
@@ -71,6 +73,10 @@ enum Tool {
     PolyFill,
     /// Lays the brush along an editable path (stitches, seams, panel lines).
     Path,
+    /// Copies the layer from a picked source (Ctrl+click).
+    Clone,
+    /// Drags the paint along with the brush.
+    Smear,
 }
 
 /// Bake cage preview (see `crate::cage`): probe results and what's drawn.
@@ -479,6 +485,8 @@ pub struct PainterApp {
     library: library_ui::LibraryUi,
     user_smarts: Vec<smart_io::UserSmart>,
     path: path_tool::PathTool,
+    clone: clone_tool::CloneState,
+    stencil: stencil::StencilState,
     bake_preview: bake_live::LivePreview,
     custom_ui: bake_live::CustomUi,
     spp: spp_open::SppOpen,
@@ -972,6 +980,21 @@ fn generator_inputs_ui(ui: &mut egui::Ui, g: &mut crate::engine::Generator, cust
     dirty
 }
 
+/// Distance between stamps in brush sizes, shown in percent: dense strokes down to 2%,
+/// dotted lines and stitches up to 500%. (Every spacing control shares the range: a
+/// slider clamps its value, so a narrower one would cut down what another set.)
+pub(crate) fn spacing_slider(ui: &mut egui::Ui, spacing: &mut f32) -> bool {
+    let mut p = *spacing * 100.0;
+    let changed = ui
+        .add(egui::Slider::new(&mut p, 2.0..=500.0).logarithmic(true).max_decimals(0).suffix("%"))
+        .on_hover_text("Distance between stamps, in brush sizes")
+        .changed();
+    if changed {
+        *spacing = p / 100.0;
+    }
+    changed
+}
+
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>) -> bool {
     labeled(ui, label, |ui| ui.add(egui::Slider::new(v, range).max_decimals(2)).changed())
 }
@@ -1439,6 +1462,8 @@ impl PainterApp {
             library: Default::default(),
             user_smarts: smart_io::list(&cc.egui_ctx),
             path: Default::default(),
+            clone: Default::default(),
+            stencil: Default::default(),
             bake_preview: Default::default(),
             custom_ui: Default::default(),
             spp: Default::default(),
@@ -2134,6 +2159,12 @@ impl PainterApp {
             if i.key_pressed(Key::Num4) || i.key_pressed(Key::L) {
                 self.tool = Tool::Path;
             }
+            if i.key_pressed(Key::Num5) {
+                self.tool = Tool::Clone;
+            }
+            if i.key_pressed(Key::Num6) {
+                self.tool = Tool::Smear;
+            }
             if i.key_pressed(Key::W) {
                 self.view.show_wire_3d = !self.view.show_wire_3d;
             }
@@ -2485,6 +2516,10 @@ impl PainterApp {
                         (Tool::PolyFill, _) => "Polygon fill",
                         (Tool::Path, StrokeTarget::Mask) => "Path (mask)",
                         (Tool::Path, _) => "Path",
+                        (Tool::Clone, StrokeTarget::Mask) => "Clone (mask)",
+                        (Tool::Clone, _) => "Clone",
+                        (Tool::Smear, StrokeTarget::Mask) => "Smear (mask)",
+                        (Tool::Smear, _) => "Smear",
                     };
                     let icon = match self.tool {
                         Tool::Paint => icons::PAINT_BRUSH,
@@ -2492,6 +2527,8 @@ impl PainterApp {
                         Tool::Picker => icons::EYEDROPPER,
                         Tool::PolyFill => icons::POLYGON,
                         Tool::Path => icons::PATH,
+                        Tool::Clone => icons::STAMP,
+                        Tool::Smear => icons::HAND_POINTING,
                     };
                     ui.label(egui::RichText::new(theme::with_icon(icon, name)).strong().color(Color32::WHITE));
                     ui.separator();
@@ -2570,7 +2607,9 @@ impl PainterApp {
                     s(ui, "Flow", &mut self.brush.flow, 0.01..=1.0, true);
                     s(ui, "Stroke opacity", &mut self.brush.opacity, 0.01..=1.0, true);
                     s(ui, "Hardness", &mut self.brush.hardness, 0.0..=0.99, true);
-                    s(ui, "Spacing", &mut self.brush.spacing, 0.02..=3.0, true);
+                    ui.label(egui::RichText::new("Spacing").color(theme::TEXT_DIM));
+                    spacing_slider(ui, &mut self.brush.spacing);
+                    ui.add_space(6.0);
                     ui.label(egui::RichText::new("Symmetry").color(theme::TEXT_DIM));
                     egui::ComboBox::from_id_salt("symmetry")
                         .width(52.0)
@@ -2599,6 +2638,8 @@ impl PainterApp {
             (Tool::Eraser, icons::ERASER, "Eraser (2)"),
             (Tool::PolyFill, icons::POLYGON, "Polygon fill: triangles, quads, mesh parts or UV islands (3 / P)"),
             (Tool::Path, icons::PATH, "Path: place points, then paint along them; stitches, seams, panel lines (4 / L)"),
+            (Tool::Clone, icons::STAMP, "Clone: Ctrl+click where to copy from, then paint (5)"),
+            (Tool::Smear, icons::HAND_POINTING, "Smear: drag the paint along with the brush (6)"),
             (Tool::Picker, icons::EYEDROPPER, "Pick material from the surface (I)"),
         ] {
             if theme::icon_button(ui, icon, self.tool == tool, 34.0).on_hover_text(tip).clicked() {
@@ -4146,12 +4187,34 @@ impl PainterApp {
     }
 
     fn brush_properties(&mut self, ui: &mut egui::Ui, content: bool) {
-        section(ui, if self.tool == Tool::Eraser { "Eraser" } else { "Brush" });
+        section(
+            ui,
+            match self.tool {
+                Tool::Eraser => "Eraser",
+                Tool::Clone => "Clone",
+                Tool::Smear => "Smear",
+                _ => "Brush",
+            },
+        );
+        match self.tool {
+            Tool::Clone => {
+                let text = if self.clone.has_source() {
+                    "Paint to copy from the source (the crosshair). Ctrl+click picks a new source."
+                } else {
+                    "Ctrl+click where to copy from, then paint where it should go."
+                };
+                ui.label(egui::RichText::new(text).small().color(theme::TEXT_DIM));
+            }
+            Tool::Smear => {
+                ui.label(egui::RichText::new("Drags the layer's paint along the stroke. Flow and stroke opacity set how far it travels.").small().color(theme::TEXT_DIM));
+            }
+            _ => {}
+        }
         slider(ui, "Size", &mut self.brush.size, 2.0..=800.0);
         slider(ui, "Hardness", &mut self.brush.hardness, 0.0..=0.99);
         slider(ui, "Flow", &mut self.brush.flow, 0.01..=1.0);
         slider(ui, "Stroke opacity", &mut self.brush.opacity, 0.01..=1.0);
-        slider(ui, "Spacing", &mut self.brush.spacing, 0.02..=1.0);
+        labeled(ui, "Spacing", |ui| spacing_slider(ui, &mut self.brush.spacing));
         section(ui, "Brush tip");
         self.tip_picker(ui);
         if self.brush.tip.is_some() {
@@ -4185,6 +4248,8 @@ impl PainterApp {
         });
         ui.label(egui::RichText::new("Shift+click draws a straight line from the last stroke.").small().color(theme::TEXT_DIM));
 
+        self.stencil_section(ui);
+
         section(ui, "Grain");
         labeled(ui, "Texture", |ui| {
             let name = self.brush.grain.map_or("None", |i| crate::textures::TEXTURES[i].name);
@@ -4206,7 +4271,9 @@ impl PainterApp {
             ui.label(egui::RichText::new("A texture fixed to the surface that breaks up the paint: scratches, dust, chipping.").small().color(theme::TEXT_DIM));
         }
 
-        if content {
+        if matches!(self.tool, Tool::Clone | Tool::Smear) {
+            // They move what's on the layer: every channel it has, no brush material.
+        } else if content {
             section(ui, if self.tool == Tool::Eraser { "Erase channels" } else { "Material" });
             material_controls(ui, &mut self.brush.mat, self.tool != Tool::Eraser);
             if self.tool != Tool::Eraser {
@@ -4913,6 +4980,7 @@ impl PainterApp {
             opacity: self.brush.opacity,
             erase: self.poly.stroke_erase,
             grain: self.grain_params(),
+            ..Default::default()
         };
         self.engine.stroke_polys(&geometry, &paint);
     }
@@ -5017,6 +5085,10 @@ impl PainterApp {
         }
         let idx = self.selected;
         if let StrokeTarget::BakeFix(_) = self.target {
+            if matches!(self.tool, Tool::Clone | Tool::Smear) {
+                self.status = "Clone and smear work on layers and masks, not on bake fixes.".into();
+                return false;
+            }
             if self.engine.begin_stroke(0, self.target, [false; crate::engine::CHANNELS], erase) {
                 self.stroke = Some(StrokeInput { view: kind, last: at, lazy: at, pressure: self.pressure });
                 return true;
@@ -5033,9 +5105,23 @@ impl PainterApp {
             self.status = "Fill layers are procedural. Add a mask to paint on it, or select a paint layer.".into();
             return false;
         }
-        if self.engine.begin_stroke(idx, self.target, self.brush.mat.enabled, erase) {
+        // Clone and smear move what the layer has, in every channel it has.
+        let moving = matches!(self.tool, Tool::Clone | Tool::Smear);
+        if self.tool == Tool::Clone && !self.clone.has_source() {
+            self.status = "Ctrl+click where to clone from first.".into();
+            return false;
+        }
+        let enabled = match (&layer.content, moving) {
+            (Content::Paint(ch), true) => std::array::from_fn(|c| ch[c].is_some()),
+            _ => self.brush.mat.enabled,
+        };
+        if self.engine.begin_stroke(idx, self.target, enabled, erase) {
             self.stroke = Some(StrokeInput { view: kind, last: at, lazy: at, pressure: self.pressure });
+            self.clone.start_smear();
             true
+        } else if moving {
+            self.status = "Nothing on this layer to move yet.".into();
+            false
         } else {
             self.status = if erase {
                 "Nothing to erase on the enabled channels.".into()
@@ -5113,12 +5199,27 @@ impl PainterApp {
         if let StrokeTarget::BakeFix(_) = self.target {
             mat.rough = self.brush.fix_value;
         }
+        let mode = match self.tool {
+            Tool::Clone | Tool::Smear => match self.clone_mode(kind, &stamps, self.tool == Tool::Smear) {
+                Some(m) => m,
+                None => return,
+            },
+            _ => crate::engine::PaintMode::Paint,
+        };
+        // Decal colors replace the brush color: only for painting layer content.
+        let decal_ok = matches!(self.tool, Tool::Paint | Tool::Path) && self.target == StrokeTarget::Content;
+        let stencil = self.stencil_for(kind).map(|mut s| {
+            s.colors &= decal_ok;
+            s
+        });
         let paint = BrushPaint {
             mat,
             mask_value: self.brush.mask_value,
             opacity: self.brush.opacity,
             erase: self.tool == Tool::Eraser,
             grain: self.grain_params(),
+            mode,
+            stencil,
         };
         let region = match kind {
             ViewKind::V3d => {
@@ -5184,7 +5285,7 @@ impl PainterApp {
 
     fn end_stroke(&mut self) {
         if let Some(s) = self.stroke.take() {
-            if matches!(self.tool, Tool::Paint | Tool::Eraser) {
+            if matches!(self.tool, Tool::Paint | Tool::Eraser | Tool::Clone | Tool::Smear) {
                 self.line_anchor = Some(LineAnchor { view: s.view, at: s.last, key: self.view_key(s.view) });
             }
             if let Some(entry) = self.engine.end_stroke() {
@@ -5296,6 +5397,10 @@ impl PainterApp {
         if navigating && self.stroke.is_none() {
             return;
         }
+        // Hold S to place the stencil.
+        if self.stroke.is_none() && self.stencil_input(ui, rect, resp) {
+            return;
+        }
         if kind == ViewKind::V3d && !mods.alt {
             let cursor = hover.filter(|p| rect.contains(*p)).map(local);
             if self.gizmo_input(ui, cursor, pressed, down) {
@@ -5390,6 +5495,8 @@ impl PainterApp {
             let in_view = rect.contains(p);
             if pressed && in_view && !mods.alt && self.stroke.is_none() && resp.hovered() && self.tool == Tool::Picker {
                 self.pick_material(kind, local(p));
+            } else if pressed && in_view && mods.ctrl && self.stroke.is_none() && resp.hovered() && self.tool == Tool::Clone {
+                self.set_clone_source(kind, local(p));
             } else if pressed && in_view && !mods.alt && self.stroke.is_none() && resp.hovered() {
                 // Shift+click: a straight line from where the last stroke ended.
                 let anchor = self.line_anchor.filter(|a| mods.shift && a.view == kind && a.key == self.view_key(kind));
@@ -5475,7 +5582,9 @@ impl PainterApp {
             ViewKind::V2d => self.views.view2d.egui_id,
         };
         painter.image(id, rect, uv, Color32::WHITE);
+        self.draw_stencil(&painter, rect);
         self.draw_path(&painter, kind, rect);
+        self.draw_clone_source(&painter, kind, rect, resp.hover_pos());
         self.draw_gizmo(&painter, kind, rect);
         self.draw_cage_brush(&painter, kind);
         if let Some(b) = self.poly.box_drag.as_ref().filter(|b| b.view == kind) {
@@ -5706,6 +5815,7 @@ impl eframe::App for PainterApp {
             self.shelf_previews = None;
         }
         self.path_keys(&ctx);
+        self.update_live_path(&ctx);
         self.shortcuts(&ctx);
         self.process_actions(&ctx);
         self.process_mcp(&ctx);

@@ -553,7 +553,7 @@ impl PainterApp {
                 let size = f32_arg(args, "size").unwrap_or(40.0).clamp(1.0, 2000.0);
                 let hardness = f32_arg(args, "hardness").unwrap_or(0.6).clamp(0.0, 0.99);
                 let flow = f32_arg(args, "flow").unwrap_or(1.0).clamp(0.01, 1.0);
-                let spacing = f32_arg(args, "spacing").unwrap_or(0.15).clamp(0.02, 1.0);
+                let spacing = f32_arg(args, "spacing").unwrap_or(0.15).clamp(0.02, 5.0);
                 let tip = match str_arg(args, "tip") {
                     Some(t) if !eq(t, "round") => {
                         Some(crate::brushes::BRUSH_ALPHAS.iter().position(|b| eq(b.name, t)).ok_or(format!("unknown brush tip '{t}'"))?)
@@ -621,6 +621,7 @@ impl PainterApp {
                     opacity: f32_arg(args, "opacity").unwrap_or(1.0).clamp(0.01, 1.0),
                     erase,
                     grain: [0.0; 4],
+                    ..Default::default()
                 };
                 let depth = self.mcp_views.as_ref().expect("rendered above").view3d.depth_view();
                 for chunk in stamps.chunks(MAX_STAMPS) {
@@ -703,6 +704,7 @@ impl PainterApp {
                     opacity: f32_arg(args, "opacity").unwrap_or(1.0).clamp(0.01, 1.0),
                     erase,
                     grain: [0.0; 4],
+                    ..Default::default()
                 };
                 self.engine.stroke_polys(&geometry, &paint);
                 if let Some(entry) = self.engine.end_stroke() {

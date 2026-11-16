@@ -8,6 +8,9 @@
 //   in world units, so it doesn't stretch at grazing angles and wraps around
 //   edges the camera can't see.
 // - UV: the stamp is a disc in texture space around the cursor's UV.
+// A stencil (an image fixed on the screen) masks the coverage where the texel
+// shows on screen; `fs_stencil_color` writes the image's colors per texel, for
+// painting it as a decal.
 
 struct StampU {
     view_proj: mat4x4<f32>,
@@ -34,6 +37,36 @@ struct Stamp {
 @group(0) @binding(4) var depth_map: texture_depth_multisampled_2d;
 @group(0) @binding(5) var alpha_tex: texture_2d<f32>;
 @group(0) @binding(6) var alpha_samp: sampler;
+// The stencil: rgb its colors, a how much paint passes.
+@group(0) @binding(7) var stencil_tex: texture_2d<f32>;
+struct StencilU {
+    a: vec4<f32>,  // center (view px), half width, half height (view px)
+    b: vec4<f32>,  // cos and sin of its rotation, on (1), unused
+};
+@group(0) @binding(8) var<uniform> st: StencilU;
+
+fn stencil_on() -> bool {
+    return st.b.z > 0.5;
+}
+
+// Where a view pixel falls on the stencil image (0..1 inside it).
+fn stencil_uv(screen: vec2<f32>) -> vec2<f32> {
+    let d = screen - st.a.xy;
+    let q = vec2<f32>(d.x * st.b.x + d.y * st.b.y, -d.x * st.b.y + d.y * st.b.x);
+    return q / (2.0 * max(st.a.zw, vec2<f32>(1e-3))) + 0.5;
+}
+
+// How much paint the stencil lets through at a view pixel (none outside the image).
+fn stencil_at(screen: vec2<f32>) -> f32 {
+    if (!stencil_on()) {
+        return 1.0;
+    }
+    let t = stencil_uv(screen);
+    if (any(t < vec2<f32>(0.0)) || any(t > vec2<f32>(1.0))) {
+        return 0.0;
+    }
+    return textureSampleLevel(stencil_tex, alpha_samp, t, 0.0).a;
+}
 
 fn lin_depth(z: f32) -> f32 {
     let n = u.clip.x;
@@ -155,6 +188,48 @@ fn coverage_uv(uv: vec2<f32>) -> f32 {
     return 1.0 - keep;
 }
 
+// A texel's view pixel in the 2D view (the screen is the texture).
+fn view2d_px(uv: vec2<f32>) -> vec2<f32> {
+    return u.view.xy * 0.5 + u.view2d.yz + (uv - 0.5) * u.view2d.x;
+}
+
+// The stencil for surface and UV stamps in the 3D view: read where the texel
+// shows on screen; texels the camera doesn't see get none.
+fn stencil_3d(p: vec3<f32>, c: vec2<i32>) -> f32 {
+    if (!stencil_on()) {
+        return 1.0;
+    }
+    let s = project(p, normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0));
+    if (s.z <= 0.0) {
+        return 0.0;
+    }
+    return stencil_at(s.xy);
+}
+
+// The stencil image's color at each texel the view shows (decals: the brush
+// paints these colors instead of its own).
+@fragment
+fn fs_stencil_color(in: FsOut) -> @location(0) vec4<f32> {
+    let c = vec2<i32>(in.pos.xy);
+    let p = textureLoad(pos_map, c, 0);
+    if (p.a < 0.5) {
+        discard;
+    }
+    let uv = in.pos.xy / vec2<f32>(textureDimensions(pos_map));
+    var screen: vec2<f32>;
+    if (u.view.z > 0.5) {
+        screen = view2d_px(uv);
+    } else {
+        let s = project(p.xyz, normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0));
+        if (s.z <= 0.0) {
+            discard;
+        }
+        screen = s.xy;
+    }
+    let t = clamp(stencil_uv(screen), vec2<f32>(0.0), vec2<f32>(1.0));
+    return vec4<f32>(textureSampleLevel(stencil_tex, alpha_samp, t, 0.0).rgb, 1.0);
+}
+
 @fragment
 fn fs_stamp(in: FsOut) -> @location(0) vec4<f32> {
     let c = vec2<i32>(in.pos.xy);
@@ -167,17 +242,18 @@ fn fs_stamp(in: FsOut) -> @location(0) vec4<f32> {
     var a = 0.0;
     if (u.view.z > 0.5) {
         // 2D view: the screen is the texture.
-        a = coverage_screen(u.view.xy * 0.5 + u.view2d.yz + (uv - 0.5) * u.view2d.x);
+        let screen = view2d_px(uv);
+        a = coverage_screen(screen) * stencil_at(screen);
     } else if (u.proj.x > 1.5) {
-        a = coverage_uv(uv);
+        a = coverage_uv(uv) * stencil_3d(p.xyz, c);
     } else {
         let n = normalize(textureLoad(nrm_map, c, 0).xyz * 2.0 - 1.0);
         if (u.proj.x > 0.5) {
-            a = coverage_surface(p.xyz, n);
+            a = coverage_surface(p.xyz, n) * stencil_3d(p.xyz, c);
         } else {
             let s = project(p.xyz, n);
             if (s.z > 0.0) {
-                a = coverage_screen(s.xy) * s.z;
+                a = coverage_screen(s.xy) * s.z * stencil_at(s.xy);
             }
             // Symmetry: a texel also takes paint where its mirror image, across
             // the mesh's center plane, is painted on screen. (The other
@@ -189,7 +265,7 @@ fn fs_stamp(in: FsOut) -> @location(0) vec4<f32> {
                 let flip = select(vec3<f32>(1.0), vec3<f32>(-1.0), vec3<i32>(1, 2, 3) == vec3<i32>(axis));
                 let m = project(p.xyz * flip, n * flip);
                 if (m.z > 0.0) {
-                    a = max(a, coverage_screen(m.xy) * m.z);
+                    a = max(a, coverage_screen(m.xy) * m.z * stencil_at(m.xy));
                 }
             }
         }

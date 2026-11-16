@@ -259,7 +259,7 @@ impl Preferences {
             rt_bounces: u("rt_bounces", d.rt_bounces as u64, 1, 16) as u32,
             brush_size: f("brush_size", d.brush_size, 1.0, 1000.0),
             brush_hardness: f("brush_hardness", d.brush_hardness, 0.0, 1.0),
-            brush_spacing: f("brush_spacing", d.brush_spacing, 0.01, 2.0),
+            brush_spacing: f("brush_spacing", d.brush_spacing, 0.02, 5.0),
             poly_padding: f("poly_padding", d.poly_padding, 0.0, 16.0),
             bake_quality: v["bake_quality"].as_str().and_then(|n| Quality::ALL.into_iter().find(|q| q.name() == n)).unwrap_or(d.bake_quality),
             bake_match_by_name: b("bake_match_by_name", d.bake_match_by_name),
@@ -499,7 +499,7 @@ impl PainterApp {
                 section(ui, "New brush defaults");
                 labeled(ui, "Size", |ui| ui.add(egui::Slider::new(&mut p.brush_size, 1.0..=400.0).max_decimals(0).suffix(" pt")));
                 labeled(ui, "Hardness", |ui| ui.add(egui::Slider::new(&mut p.brush_hardness, 0.0..=1.0).max_decimals(2)));
-                labeled(ui, "Spacing", |ui| ui.add(egui::Slider::new(&mut p.brush_spacing, 0.01..=1.0).max_decimals(2)));
+                labeled(ui, "Spacing", |ui| super::spacing_slider(ui, &mut p.brush_spacing));
                 hint(ui, "Used when the app starts.");
                 section(ui, "Polygon fill");
                 labeled(ui, "Seam padding", |ui| ui.add(egui::Slider::new(&mut p.poly_padding, 0.0..=16.0).max_decimals(1).suffix(" texels")));

@@ -227,7 +227,7 @@ impl PainterApp {
             }
         }
         self.engine.replay_splats(&batch, su(2.0));
-        self.engine.finish_replay(&BrushPaint { mat, mask_value: brush.value, opacity: opacity.clamp(0.0, 1.0), erase, grain: [0.0; 4] });
+        self.engine.finish_replay(&BrushPaint { mat, mask_value: brush.value, opacity: opacity.clamp(0.0, 1.0), erase, grain: [0.0; 4], ..Default::default() });
         landed
     }
 
@@ -340,7 +340,7 @@ impl PainterApp {
                 continue;
             }
             self.engine.replay_polys(&r.topo.uv_geometry(&tris, r.pad));
-            self.engine.finish_replay(&BrushPaint { mat, mask_value: value, opacity: 1.0, erase: false, grain: [0.0; 4] });
+            self.engine.finish_replay(&BrushPaint { mat, mask_value: value, opacity: 1.0, erase: false, grain: [0.0; 4], ..Default::default() });
             filled += tris.len();
         }
         filled

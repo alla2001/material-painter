@@ -76,7 +76,14 @@ maps, build materials in a node graph and write your own node shaders.
   read the painted channels, baked maps and lighting, and custom ones are
   plain WGSL like any node.
 - **Path tool**: place points on the mesh or the UV map and lay the brush
-  evenly along the curve, for clean stitches, seams and panel lines.
+  evenly along the curve, for clean stitches, seams and panel lines. Click the
+  curve to add a point; after Apply the path stays live, so moving points or
+  changing the brush repaints it.
+- **Clone and smear brushes** for paint layers and masks: Ctrl+click a source
+  and clone from it, or drag the paint along. Both work in texture space.
+- **Stencils**: hold an image over the view and paint through it (by its
+  alpha, brightness or a color channel), or paint its own colors for decals.
+  Hold S to move, scale and turn it.
 - **Asset library**: about 2,900 free CC0 materials from Poly Haven and
   ambientCG, one click from the shelf, plus a community library of material
   graphs and nodes that users share from inside the app. Downloads are plain

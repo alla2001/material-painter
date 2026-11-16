@@ -320,6 +320,7 @@ fn paint_projections() {
             opacity: 1.0,
             erase: false,
             grain: if grain { [1.0, 3.0 / extent, 0.0, 0.0] } else { [0.0; 4] },
+            ..Default::default()
         };
         engine.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
         engine.end_stroke();
@@ -424,6 +425,7 @@ fn perf_4k() {
         opacity: 1.0,
         erase: false,
         grain: [0.0; 4],
+        ..Default::default()
     };
     for (name, layer) in [("top layer", top), ("bottom layer", 0)] {
     assert!(engine.begin_stroke(layer, StrokeTarget::Content, [true, true, true, false, false, false, false, false], false));
@@ -1714,6 +1716,7 @@ fn texture_sets_paint_apart() {
         opacity: 1.0,
         erase: false,
         grain: [0.0; 4],
+        ..Default::default()
     };
     left.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
     left.end_stroke();
@@ -2274,7 +2277,7 @@ fn transparency_paints_shows_and_exports() {
     };
     let mut clear = MatValues { opacity: 0.0, ..Default::default() };
     clear.enabled = only_opacity;
-    let paint = BrushPaint { mat: clear, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4] };
+    let paint = BrushPaint { mat: clear, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4], ..Default::default() };
     left.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
     left.end_stroke();
     left.composite();
@@ -2729,7 +2732,7 @@ fn poly_fill_padding_stays_off_other_islands() {
     let geometry = topo.uv_geometry(&a, 8.0 / res as f32);
     assert!(!geometry.padding.is_empty(), "A's outline is padded");
     let red = MatValues { color: [1.0, 0.0, 0.0], enabled: only, ..Default::default() };
-    engine.stroke_polys(&geometry, &BrushPaint { mat: red, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4] });
+    engine.stroke_polys(&geometry, &BrushPaint { mat: red, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4], ..Default::default() });
     engine.end_stroke();
     engine.composite();
 
@@ -2859,7 +2862,7 @@ fn emission_paints_glows_and_exports() {
     };
     let mut green = MatValues { emission: [0.1, 1.0, 0.2], ..Default::default() };
     green.enabled = only;
-    let paint = BrushPaint { mat: green, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4] };
+    let paint = BrushPaint { mat: green, mask_value: 1.0, opacity: 1.0, erase: false, grain: [0.0; 4], ..Default::default() };
     engine.stroke_step(&stamps, su, views.view3d.depth_view(), &paint, None);
     engine.end_stroke();
     engine.composite();
@@ -2969,4 +2972,141 @@ fn spp_screenshot() {
     }
     harness.run_steps(1);
     harness.render().expect("renders").save(dir.join("shot_raytraced.png")).unwrap();
+}
+
+/// Clone, smear and the stencil, painted in the 2D view of a plane whose UVs fill the
+/// square (view pixels are texels): clone copies a red disc to the right, also on a
+/// mask; smear drags a disc's edge along; a stencil lets paint through only its opaque
+/// half, and with its colors on lays the image's blue down (a decal). Frames go to
+/// `target/bake_test/brush_modes_*.png`.
+#[test]
+#[ignore]
+fn clone_smear_and_stencil() {
+    use crate::engine::{BrushPaint, CHANNELS, FillParams, MatValues, PaintMode, Stamp, StampUniform, Stencil};
+    use crate::undo::{StrokeTarget, UndoStack};
+    use glam::Vec2;
+
+    let positions = vec![Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(-1.0, 0.0, 1.0)];
+    let uvs = vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)];
+    let mesh = Mesh::from_parts("Plane".into(), positions, Some(vec![Vec3::Y; 4]), uvs, vec![0, 2, 1, 0, 3, 2]);
+    let rs = render_state();
+    let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
+    let res = 128u32;
+    let n = res as f32;
+    let env = crate::environment::EnvBaker::new(&rs.device).upload(&rs, &crate::environment::decode(&crate::environment::EnvSource::Builtin(0)).unwrap());
+    // The 2D view: 128 px showing the UV square, one texel per pixel.
+    let su = |radius: f32| StampUniform {
+        view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        cam_pos: [0.0; 4],
+        view: [n, n, 1.0, 0.0],
+        view2d: [n, 0.0, 0.0, 0.0],
+        brush: [radius, 0.9, 1.0, 0.0],
+        clip: [crate::viewport::NEAR, crate::viewport::FAR, 0.0, 0.0],
+        proj: [0.0, 0.0, 0.0, 0.0],
+    };
+    let stamp = |x: f32, y: f32| -> Stamp { [[x, y, 1.0, 0.0], [0.0; 4], [0.0; 4], [0.0; 4], [0.0, 0.0, 1.0, 0.0]] };
+    let mut color_only = [false; CHANNELS];
+    color_only[0] = true;
+    let red = BrushPaint { mat: MatValues { color: [1.0, 0.0, 0.0], enabled: color_only, ..Default::default() }, ..Default::default() };
+    let fresh = |engine: &mut Engine, undo: &mut UndoStack| {
+        engine.layers.clear();
+        let black = MatValues { color: [0.0; 3], ..Default::default() };
+        engine.add_fill_layer(0, None, "Black".into(), FillParams { mat: black, ..Default::default() }, undo);
+        engine.add_paint_layer(1, None, None, undo);
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/bake_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let final_color = |engine: &mut Engine, name: &str| {
+        engine.composite();
+        let px = read_texture(&rs.device, &rs.queue, engine.final_tex(0));
+        image::save_buffer(dir.join(format!("brush_modes_{name}.png")), &px, res, res, image::ExtendedColorType::Rgba8).unwrap();
+        px
+    };
+    let at = |px: &[u8], x: u32, y: u32| -> [u8; 3] {
+        let i = ((y * res + x) * 4) as usize;
+        [px[i], px[i + 1], px[i + 2]]
+    };
+    let mut engine = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
+    let mut undo = UndoStack::default();
+    // The stamp pass binds the 3D view's depth (unused in the 2D view).
+    let mut views = ViewRenderer::new(&rs);
+    views.render_3d(&rs, [64, 64], &[&engine], &env, &gpu_mesh, &OrbitCam::default(), &ViewSettings::default(), None);
+    let depth = views.view3d.depth_view();
+
+    // Clone: a red disc at x 32, copied 64 texels to the right.
+    fresh(&mut engine, &mut undo);
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, color_only, false));
+    engine.stroke_step(&[stamp(32.0, 64.0)], su(16.0), depth, &red, None);
+    engine.end_stroke();
+    let clone = BrushPaint { mode: PaintMode::Clone([-0.5, 0.0]), ..Default::default() };
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, color_only, false));
+    engine.stroke_step(&[stamp(96.0, 64.0)], su(20.0), depth, &clone, None);
+    engine.end_stroke();
+    let px = final_color(&mut engine, "clone");
+    println!("  clone: source {:?}, copy {:?}, between {:?}", at(&px, 32, 64), at(&px, 96, 64), at(&px, 64, 64));
+    assert!(at(&px, 96, 64)[0] > 200 && at(&px, 96, 64)[1] < 30, "the disc was copied");
+    assert!(at(&px, 32, 64)[0] > 200, "the source stays");
+    assert!(at(&px, 64, 64)[0] < 20, "nothing in between");
+
+    // Clone on a mask: a red layer, a black disc painted on its mask, cloned right.
+    fresh(&mut engine, &mut undo);
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, color_only, false));
+    engine.stroke_step(&[stamp(64.0, 64.0)], su(200.0), depth, &red, None);
+    engine.end_stroke();
+    engine.add_mask(1, true, None, &mut undo);
+    assert!(engine.begin_stroke(1, StrokeTarget::Mask, color_only, false));
+    engine.stroke_step(&[stamp(32.0, 64.0)], su(16.0), depth, &BrushPaint { mask_value: 0.0, ..Default::default() }, None);
+    engine.end_stroke();
+    assert!(engine.begin_stroke(1, StrokeTarget::Mask, color_only, false));
+    engine.stroke_step(&[stamp(96.0, 64.0)], su(20.0), depth, &clone, None);
+    engine.end_stroke();
+    let px = final_color(&mut engine, "clone_mask");
+    println!("  mask clone: source {:?}, copy {:?}, between {:?}", at(&px, 32, 64), at(&px, 96, 64), at(&px, 64, 64));
+    assert!(at(&px, 32, 64)[0] < 20 && at(&px, 96, 64)[0] < 20, "the mask's hole was copied");
+    assert!(at(&px, 64, 64)[0] > 200, "the layer shows between");
+
+    // Smear: a disc at x 32 (edge near 48), then the brush drags from 32 to 72.
+    fresh(&mut engine, &mut undo);
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, color_only, false));
+    engine.stroke_step(&[stamp(32.0, 64.0)], su(16.0), depth, &red, None);
+    engine.end_stroke();
+    let before = final_color(&mut engine, "smear_before");
+    assert!(engine.begin_stroke(1, StrokeTarget::Content, color_only, false));
+    let mut x = 32.0;
+    let mut last: Option<f32> = None;
+    while x <= 72.0 {
+        let step = last.map_or(0.0, |l| x - l);
+        let smear = BrushPaint { mode: PaintMode::Smear([-step / n, 0.0]), ..Default::default() };
+        engine.stroke_step(&[stamp(x, 64.0)], su(12.0), depth, &smear, None);
+        last = Some(x);
+        x += 3.0;
+    }
+    engine.end_stroke();
+    let px = final_color(&mut engine, "smear");
+    println!("  smear at x 60: {:?} before, {:?} after", at(&before, 60, 64), at(&px, 60, 64));
+    assert!(at(&before, 60, 64)[0] < 10, "nothing there before");
+    assert!(at(&px, 60, 64)[0] > 60, "the paint was dragged along");
+    assert!(at(&px, 60, 20)[0] < 10, "only along the stroke");
+
+    // Stencil: a 64 px image at the center, its left half opaque blue, right half clear.
+    let mut img = image::RgbaImage::new(64, 64);
+    for (x, _, p) in img.enumerate_pixels_mut() {
+        *p = if x < 32 { image::Rgba([0, 0, 255, 255]) } else { image::Rgba([0, 255, 0, 0]) };
+    }
+    let tex = Arc::new(crate::gpu::upload_mips(&rs.device, &rs.queue, img, wgpu::TextureFormat::Rgba8Unorm, "stencil"));
+    let stencil = |colors: bool| Some(Stencil { tex: tex.clone(), uniform: [64.0, 64.0, 32.0, 32.0, 1.0, 0.0, 1.0, 0.0], colors });
+    for (colors, name) in [(false, "stencil"), (true, "decal")] {
+        fresh(&mut engine, &mut undo);
+        assert!(engine.begin_stroke(1, StrokeTarget::Content, color_only, false));
+        let paint = BrushPaint { mat: red.mat, stencil: stencil(colors), ..Default::default() };
+        engine.stroke_step(&[stamp(64.0, 64.0)], su(60.0), depth, &paint, None);
+        engine.end_stroke();
+        let px = final_color(&mut engine, name);
+        println!("  {name}: opaque half {:?}, clear half {:?}, outside {:?}", at(&px, 48, 64), at(&px, 80, 64), at(&px, 16, 64));
+        let want = if colors { [0, 0, 255] } else { [255, 0, 0] };
+        let got = at(&px, 48, 64);
+        assert!((0..3).all(|k| (got[k] as i32 - want[k] as i32).abs() < 40), "{name}: the opaque half takes paint ({got:?})");
+        assert!(at(&px, 80, 64).iter().all(|&v| v < 20), "{name}: the clear half blocks it");
+        assert!(at(&px, 16, 64).iter().all(|&v| v < 20), "{name}: nothing outside the image");
+    }
 }

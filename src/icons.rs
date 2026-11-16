@@ -6,6 +6,9 @@ pub const FONT: &[u8] = include_bytes!("../assets/fonts/Phosphor.ttf");
 
 pub const PAINT_BRUSH: &str = "\u{E6F0}";
 pub const ERASER: &str = "\u{E21E}";
+pub const STAMP: &str = "\u{EA48}";
+pub const HAND_POINTING: &str = "\u{E29A}";
+pub const STICKER: &str = "\u{E5AC}";
 pub const EYEDROPPER: &str = "\u{E568}";
 pub const PAINT_BUCKET: &str = "\u{E392}";
 pub const POLYGON: &str = "\u{E6D0}";

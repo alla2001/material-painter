@@ -449,7 +449,7 @@ impl PainterApp {
             return false;
         }
         self.engine.replay_polys(&r.topo.uv_geometry(&tris, r.pad));
-        self.engine.finish_replay(&crate::engine::BrushPaint { mat, mask_value: value, opacity: 1.0, erase: false, grain: [0.0; 4] });
+        self.engine.finish_replay(&crate::engine::BrushPaint { mat, mask_value: value, opacity: 1.0, erase: false, grain: [0.0; 4], ..Default::default() });
         true
     }
 
@@ -641,7 +641,7 @@ impl PainterApp {
         }
         if self.engine.begin_replay(idx, StrokeTarget::Mask, [false; CHANNELS], false) {
             self.engine.replay_polys(&r.topo.uv_geometry(&off, r.pad));
-            self.engine.finish_replay(&crate::engine::BrushPaint { mat: MatValues::default(), mask_value: 0.0, opacity: 1.0, erase: false, grain: [0.0; 4] });
+            self.engine.finish_replay(&crate::engine::BrushPaint { mat: MatValues::default(), mask_value: 0.0, opacity: 1.0, erase: false, grain: [0.0; 4], ..Default::default() });
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "material_painter"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "A PBR texture painter: layers, smart materials, mesh map baking, material graphs and custom node shaders"
 license = "GPL-3.0-or-later"

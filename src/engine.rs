@@ -65,6 +65,8 @@ const MASK_FILTER_FORMAT: F = F::R16Float;
 const MAX_MASK_FILTER_STEPS: u64 = 256;
 const MASK_FILTER_STRIDE: u64 = 256;
 const STROKE_FORMAT: F = F::R16Float;
+/// A decal stroke's colors (sRGB-encoded, like the brush color).
+const DECAL_FORMAT: F = F::Rgba8Unorm;
 pub const MAX_STAMPS: usize = 512;
 
 /// One brush stamp, as `stamp.wgsl` reads it: screen xy, radius scale,
@@ -1005,6 +1007,33 @@ struct ApplyUniform {
     /// Specular level, whether the stroke paints it, whether it paints the
     /// normal channel (flat), unused.
     s: [f32; 4],
+    /// Mode (0 paint, 1 clone, 2 smear), source offset in uv, decal colors.
+    k: [f32; 4],
+}
+
+/// What a stroke does with the target.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum PaintMode {
+    /// Lays the brush material down.
+    #[default]
+    Paint,
+    /// Copies the target from this offset in UV (source minus destination), over what's there.
+    Clone([f32; 2]),
+    /// Mixes in the target as it is, from this offset in UV (back along the brush's
+    /// movement this frame): the paint travels with the brush.
+    Smear([f32; 2]),
+}
+
+/// An image fixed on the screen that masks the brush (`stamp.wgsl`).
+#[derive(Clone)]
+pub struct Stencil {
+    /// rgb its colors, a how much paint passes.
+    pub tex: Arc<Tex>,
+    /// Center (view px), half width, half height (view px); cos and sin of the
+    /// rotation, then 1 (on), unused.
+    pub uniform: [f32; 8],
+    /// The brush paints the image's colors instead of its own (decals).
+    pub colors: bool,
 }
 
 /// What the brush deposits during a stroke.
@@ -1015,6 +1044,23 @@ pub struct BrushPaint {
     pub erase: bool,
     /// Grain strength (0 off), tiling, in uv (else tri-planar world), invert; see `apply.wgsl`.
     pub grain: [f32; 4],
+    pub mode: PaintMode,
+    /// Brush strokes only; polygon fills and replays ignore it.
+    pub stencil: Option<Stencil>,
+}
+
+impl Default for BrushPaint {
+    fn default() -> Self {
+        BrushPaint {
+            mat: MatValues::default(),
+            mask_value: 1.0,
+            opacity: 1.0,
+            erase: false,
+            grain: [0.0; 4],
+            mode: PaintMode::Paint,
+            stencil: None,
+        }
+    }
 }
 
 struct ActiveStroke {
@@ -1048,6 +1094,8 @@ struct Pipelines {
     dilate_bgl: wgpu::BindGroupLayout,
     stamp: wgpu::RenderPipeline,
     stamp_bgl: wgpu::BindGroupLayout,
+    /// A decal stroke's colors per texel, from the stencil (`fs_stencil_color`).
+    stencil_color: wgpu::RenderPipeline,
     /// Replayed stamps drawn over the triangles they reach (`vs_splat`).
     splat: wgpu::RenderPipeline,
     splat_pad: wgpu::RenderPipeline,
@@ -1131,6 +1179,12 @@ pub struct Engine {
     stamp_ubuf: wgpu::Buffer,
     stamp_sbuf: wgpu::Buffer,
     apply_ubuf: wgpu::Buffer,
+    /// The stencil's placement (`Stencil::uniform`), zero when there is none.
+    stencil_ubuf: wgpu::Buffer,
+    /// Bound when there's no stencil.
+    stencil_blank: Tex,
+    /// A decal stroke's colors per texel (made on first use).
+    decal: Option<Tex>,
     /// Brush tip (alpha) the stamps sample when the brush uses one.
     brush_alpha: Tex,
     /// Brush grain texture (white when the brush has none).
@@ -1219,6 +1273,7 @@ impl Engine {
         let stamp_ubuf = buffer("stamp uniform", size_of::<StampUniform>() as u64, wgpu::BufferUsages::UNIFORM);
         let stamp_sbuf = buffer("stamps", (MAX_STAMPS * size_of::<Stamp>()) as u64, wgpu::BufferUsages::STORAGE);
         let apply_ubuf = buffer("apply uniform", size_of::<ApplyUniform>() as u64, wgpu::BufferUsages::UNIFORM);
+        let stencil_ubuf = buffer("stencil uniform", 32, wgpu::BufferUsages::UNIFORM);
 
         let mut engine = Engine {
             rs: rs.clone(),
@@ -1252,6 +1307,9 @@ impl Engine {
             stamp_ubuf,
             stamp_sbuf,
             apply_ubuf,
+            stencil_ubuf,
+            stencil_blank: Tex::new(&device, "no stencil", 1, 1, F::Rgba8Unorm, LAYER_USAGE),
+            decal: None,
             brush_alpha: Tex::new(&device, "brush alpha", 1, 1, F::R8Unorm, LAYER_USAGE),
             brush_grain: Tex::new(&device, "brush grain", 1, 1, F::R8Unorm, LAYER_USAGE),
             image_cache: HashMap::new(),
@@ -1361,6 +1419,8 @@ impl Engine {
                 gpu::tex_entry(3, false),
                 gpu::tex_entry(5, true),
                 gpu::sampler_entry(6),
+                gpu::tex_entry(7, true),
+                gpu::uniform_entry(8, false),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1389,6 +1449,15 @@ impl Engine {
                 blend: Some(wgpu::BlendState { color: flow_blend, alpha: flow_blend }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
+        );
+
+        let stencil_color = gpu::fullscreen_pipeline(
+            device,
+            "stencil colors",
+            &stamp_module,
+            "fs_stencil_color",
+            &gpu::layout(device, &stamp_bgl),
+            &[gpu::target(DECAL_FORMAT)],
         );
 
         let splat_layout = gpu::layout(device, &stamp_bgl);
@@ -1481,6 +1550,7 @@ impl Engine {
                 gpu::tex_entry(11, false),
                 gpu::tex_entry(12, false),
                 gpu::tex_entry(13, false),
+                gpu::tex_entry(14, false),
             ],
         });
         let apply_layout = gpu::layout(device, &apply_bgl);
@@ -1633,6 +1703,7 @@ impl Engine {
             dilate_bgl,
             stamp,
             stamp_bgl,
+            stencil_color,
             splat,
             splat_pad,
             poly,
@@ -3029,6 +3100,8 @@ impl Engine {
             self.splat_depth = Some(t.create_view(&Default::default()));
         }
         let depth = self.splat_depth.as_ref().expect("made above");
+        self.queue.write_buffer(&self.stencil_ubuf, 0, bytemuck::bytes_of(&[0.0f32; 8]));
+        let stencil_view = &self.stencil_blank.view;
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("splat"),
             layout: &self.p.stamp_bgl,
@@ -3040,6 +3113,8 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(depth) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.brush_alpha.view) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(stencil_view) },
+                wgpu::BindGroupEntry { binding: 8, resource: self.stencil_ubuf.as_entire_binding() },
             ],
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -3144,8 +3219,15 @@ impl Engine {
         su.view[3] = stamps.len() as f32;
         self.queue.write_buffer(&self.stamp_ubuf, 0, bytemuck::bytes_of(&su));
         self.queue.write_buffer(&self.stamp_sbuf, 0, bytemuck::cast_slice(stamps));
+        let stencil = paint.stencil.as_ref();
+        self.queue.write_buffer(&self.stencil_ubuf, 0, bytemuck::bytes_of(&stencil.map_or([0.0; 8], |s| s.uniform)));
+        let decal = stencil.is_some_and(|s| s.colors) && self.active.as_ref().is_some_and(|a| a.channels.contains(&0));
+        if decal && self.decal.as_ref().is_none_or(|t| t.width != self.res) {
+            self.decal = Some(Tex::new(&self.device, "decal colors", self.res, self.res, DECAL_FORMAT, LAYER_USAGE));
+        }
 
         let device = &self.device;
+        let stencil_view = stencil.map_or(&self.stencil_blank.view, |s| &s.tex.view);
         let stamp_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("stamp"),
             layout: &self.p.stamp_bgl,
@@ -3157,9 +3239,15 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(depth) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.brush_alpha.view) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(stencil_view) },
+                wgpu::BindGroupEntry { binding: 8, resource: self.stencil_ubuf.as_entire_binding() },
             ],
         });
         let mut encoder = device.create_command_encoder(&Default::default());
+        // Smearing mixes in the target as it is now: a fresh base, and only this frame's stamps.
+        if matches!(paint.mode, PaintMode::Smear(_)) {
+            self.encode_rebase(&mut encoder);
+        }
         {
             let mut pass = gpu::pass(
                 &mut encoder,
@@ -3170,7 +3258,13 @@ impl Engine {
             pass.set_bind_group(0, &stamp_bg, &[]);
             pass.draw(0..3, 0..1);
         }
-        self.encode_apply(&mut encoder, paint);
+        if decal && let Some(t) = &self.decal {
+            let mut pass = gpu::pass(&mut encoder, "stencil colors", &[gpu::color_attachment(&t.view, wgpu::LoadOp::Load)]);
+            pass.set_pipeline(&self.p.stencil_color);
+            pass.set_bind_group(0, &stamp_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.encode_apply_with(&mut encoder, paint, decal);
         self.queue.submit([encoder.finish()]);
     }
 
@@ -3246,8 +3340,28 @@ impl Engine {
         );
     }
 
+    /// Takes the stroke's base again from the target as it is now, and clears the stroke
+    /// mask (smearing works frame by frame).
+    fn encode_rebase(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(active) = &self.active else { return };
+        let Some(textures) = self.target_textures(active.layer_id, active.target, &active.channels) else { return };
+        let snaps: Vec<&Tex> = match active.target {
+            StrokeTarget::Mask => self.snap_mask.iter().collect(),
+            _ => active.channels.iter().filter_map(|&c| self.snap[c].as_ref()).collect(),
+        };
+        for (src, dst) in textures.iter().zip(&snaps) {
+            encoder.copy_texture_to_texture(src.copy_info(), dst.copy_info(), src.extent());
+        }
+        gpu::clear_texture(encoder, &self.stroke, wgpu::Color::TRANSPARENT);
+    }
+
     /// Writes the stroke mask into the active stroke's target.
     fn encode_apply(&mut self, encoder: &mut wgpu::CommandEncoder, paint: &BrushPaint) {
+        self.encode_apply_with(encoder, paint, false);
+    }
+
+    /// As [`Engine::encode_apply`]; `decal` paints the colors the stencil pass wrote.
+    fn encode_apply_with(&mut self, encoder: &mut wgpu::CommandEncoder, paint: &BrushPaint, decal: bool) {
         let Some(active) = &self.active else { return };
         let (target, channels, layer_id) = (active.target, active.channels.clone(), active.layer_id);
         let mut ch = [0.0f32; CHANNELS];
@@ -3264,6 +3378,11 @@ impl Engine {
             g: if matches!(target, StrokeTarget::BakeFix(_)) { [0.0; 4] } else { paint.grain },
             e: [m.emission[0], m.emission[1], m.emission[2], ch[EMISSION]],
             s: [m.specular, ch[SPECULAR], ch[NORMAL], 0.0],
+            k: match paint.mode {
+                PaintMode::Paint => [0.0, 0.0, 0.0, if decal { 1.0 } else { 0.0 }],
+                PaintMode::Clone([x, y]) => [1.0, x, y, 0.0],
+                PaintMode::Smear([x, y]) => [2.0, x, y, 0.0],
+            },
         };
         self.queue.write_buffer(&self.apply_ubuf, 0, bytemuck::bytes_of(&au));
 
@@ -3299,6 +3418,10 @@ impl Engine {
                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(snap_view(EMISSION)) },
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(snap_view(NORMAL)) },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(snap_view(SPECULAR)) },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(self.decal.as_ref().filter(|_| decal).map_or(&self.dummy.view, |t| &t.view)),
+                },
             ],
         });
 

@@ -8,6 +8,10 @@
 //! sampled in that space, then laid out on screen by arc length at the
 //! brush spacing, and painted through the same stamp pipeline as strokes
 //! (one undo step).
+//!
+//! An applied path stays live: moving, adding or removing points, or changing the brush,
+//! paints it again in place of the last pass (while that pass is still the last step in
+//! the history). Clicking on the curve adds a point there.
 
 use super::{PainterApp, ViewKind, theme};
 use crate::icons;
@@ -57,11 +61,27 @@ pub(super) struct PathTool {
     hovered: Option<usize>,
     /// Just painted: only the points are drawn, so the result shows.
     applied: bool,
+    /// The painted pass that edits replace: its history serial, and what it was painted
+    /// with (brush, layer, path settings), so a change paints it again.
+    live: Option<(u64, String)>,
+    /// The path changed since it was painted; it paints again once the pointer is up.
+    changed: bool,
 }
 
 impl Default for PathTool {
     fn default() -> Self {
-        PathTool { view: None, points: Vec::new(), smooth: true, closed: false, align: true, drag: None, hovered: None, applied: false }
+        PathTool {
+            view: None,
+            points: Vec::new(),
+            smooth: true,
+            closed: false,
+            align: true,
+            drag: None,
+            hovered: None,
+            applied: false,
+            live: None,
+            changed: false,
+        }
     }
 }
 
@@ -72,6 +92,14 @@ impl PathTool {
         self.drag = None;
         self.hovered = None;
         self.applied = false;
+        self.live = None;
+        self.changed = false;
+    }
+
+    /// The points moved, or one came or went.
+    fn edited(&mut self) {
+        self.applied = false;
+        self.changed = true;
     }
 
     /// The curve through the points, densely sampled, in path space.
@@ -90,6 +118,7 @@ impl PathTool {
             }
         };
         let mut out = Vec::with_capacity(seg_count * SUBDIV + 1);
+        // Sample k lies on segment k / SUBDIV (see `insert_index`).
         for s in 0..seg_count as isize {
             let (p0, p1, p2, p3) = (at(s - 1), at(s), at(s + 1), at(s + 2));
             for k in 0..SUBDIV {
@@ -101,6 +130,25 @@ impl PathTool {
         out.push(pts[0].like(if self.closed { at(0) } else { at(n as isize - 1) }));
         out
     }
+}
+
+/// Where a point picked on curve sample `sample` goes in the point list: after the
+/// segment's first point.
+fn insert_index(sample: usize, points: usize) -> usize {
+    (sample / SUBDIV + 1).min(points)
+}
+
+/// The polyline sample nearest `at`, and how far it is.
+fn nearest_sample(line: &[Vec2], at: Vec2) -> Option<(usize, f32)> {
+    line.windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            let (a, b) = (w[0], w[1]);
+            let ab = b - a;
+            let t = if ab.length_squared() > 1e-9 { ((at - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+            (i, at.distance(a + ab * t))
+        })
+        .min_by(|x, y| x.1.total_cmp(&y.1))
 }
 
 /// Centripetal Catmull-Rom: no cusps or loops on uneven spacing.
@@ -154,7 +202,7 @@ pub(super) fn resample(line: &[Vec2], step: f32, closed: bool) -> Vec<(Vec2, Vec
 
 impl PainterApp {
     /// A path point in view pixels (the stamp coordinate space).
-    fn path_to_screen(&self, kind: ViewKind, p: PathPoint) -> Option<Vec2> {
+    pub(super) fn path_to_screen(&self, kind: ViewKind, p: PathPoint) -> Option<Vec2> {
         match (kind, p) {
             (ViewKind::V3d, PathPoint::Surface(w)) => {
                 let [sw, sh] = self.views.view3d.size;
@@ -209,9 +257,11 @@ impl PainterApp {
         };
         if let Some(i) = self.path.drag {
             if down && let Some(at) = cursor {
-                if let Some(p) = self.path_from_screen(kind, at) {
+                if let Some(p) = self.path_from_screen(kind, at)
+                    && self.path.points[i] != p
+                {
                     self.path.points[i] = p;
-                    self.path.applied = false;
+                    self.path.edited();
                 }
                 return;
             }
@@ -228,7 +278,7 @@ impl PainterApp {
         if secondary {
             if let Some(i) = self.path.hovered {
                 self.path.points.remove(i);
-                self.path.applied = false;
+                self.path.edited();
                 self.path.hovered = None;
             }
             return;
@@ -244,13 +294,26 @@ impl PainterApp {
             self.status = "Place path points on the mesh.".into();
             return;
         };
+        // On the curve: a new point there, between its neighbours, ready to drag.
+        if self.path.view == Some(kind) && self.path.points.len() >= 2 {
+            let line: Vec<Vec2> = self.path.curve().into_iter().map(|q| self.path_to_screen(kind, q).unwrap_or(Vec2::splat(f32::MAX))).collect();
+            if let Some((k, d)) = nearest_sample(&line, at)
+                && d <= grab
+            {
+                let i = insert_index(k, self.path.points.len());
+                self.path.points.insert(i, p);
+                self.path.drag = Some(i);
+                self.path.edited();
+                return;
+            }
+        }
         if self.path.view != Some(kind) {
             // A path belongs to one view; starting in the other begins a new one.
             self.path.clear();
             self.path.view = Some(kind);
         }
         self.path.points.push(p);
-        self.path.applied = false;
+        self.path.edited();
     }
 
     /// The stamps the path lays down: (view pixel, direction).
@@ -263,6 +326,43 @@ impl PainterApp {
         let radius = self.brush.size * 0.5 * self.ppp;
         let step = (self.brush.spacing * radius * 2.0).max(1.0);
         Some((kind, resample(&screen, step, self.path.closed)))
+    }
+
+    /// What a painted path depends on besides its points: a change paints it again.
+    fn path_inputs(&self) -> String {
+        let b = &self.brush;
+        format!(
+            "{:?}",
+            (
+                (b.size, b.spacing, b.hardness, b.flow, b.opacity, b.angle, b.tip, b.mat, b.mask_value, b.projection, b.follow),
+                (b.angle_jitter, b.size_jitter, b.scatter, b.grain, b.grain_scale, b.grain_strength, b.grain_invert),
+                (self.selected, self.target, self.sets.active, self.tool == super::Tool::Eraser),
+                (self.path.smooth, self.path.closed, self.path.align),
+            )
+        )
+    }
+
+    /// Paints a live path again after an edit, in place of its last pass, once the
+    /// pointer is up (a drag repaints when it ends, not every frame). Call every frame.
+    pub(super) fn update_live_path(&mut self, ctx: &egui::Context) {
+        let Some((serial, inputs)) = &self.path.live else { return };
+        if self.undo.state_serial() != *serial {
+            // Something else was done since (or the pass was undone): nothing to replace.
+            self.path.live = None;
+            return;
+        }
+        let changed = self.path.changed || *inputs != self.path_inputs();
+        if !changed || self.path.drag.is_some() || ctx.input(|i| i.pointer.any_down()) || self.stroke.is_some() {
+            return;
+        }
+        self.path.changed = false;
+        if self.path.points.len() < 2 {
+            return;
+        }
+        self.engine.undo(&mut self.undo);
+        // The replaced pass isn't something to redo.
+        self.undo.redo.pop();
+        self.apply_path();
     }
 
     /// Paints the brush along the path as one stroke (one undo step).
@@ -284,7 +384,12 @@ impl PainterApp {
         }
         self.end_stroke();
         self.path.applied = true;
-        self.status = format!("Painted {} stamps along the path. Ctrl+Z undoes it; the path stays for another pass.", raw.len());
+        self.path.changed = false;
+        self.path.live = Some((self.undo.state_serial(), self.path_inputs()));
+        self.status = format!(
+            "Painted {} stamps along the path. Edit the points or the brush to repaint it; Apply again adds another pass.",
+            raw.len()
+        );
     }
 
     /// Draws the path, its points and where the stamps will land.
@@ -340,22 +445,19 @@ impl PainterApp {
         if ui.add_enabled(n >= 2, apply).on_hover_text("Paint the brush along the path (Enter)").clicked() {
             self.apply_path();
         }
-        if ui.add_enabled(n > 0, egui::Button::new("Clear")).on_hover_text("Start over (Esc)").clicked() {
+        if ui.add_enabled(n > 0, egui::Button::new("Clear")).on_hover_text("Start over (Esc); what's painted stays").clicked() {
             self.path.clear();
         }
         ui.add_space(6.0);
         ui.label(egui::RichText::new("Spacing").color(theme::TEXT_DIM));
-        let mut p = self.brush.spacing * 100.0;
-        if ui.add(egui::Slider::new(&mut p, 2.0..=300.0).max_decimals(0).suffix("%")).on_hover_text("Distance between stamps, in brush sizes").changed() {
-            self.brush.spacing = p / 100.0;
-        }
+        super::spacing_slider(ui, &mut self.brush.spacing);
         ui.label(egui::RichText::new("Size").color(theme::TEXT_DIM));
         ui.add(egui::Slider::new(&mut self.brush.size, 2.0..=800.0).max_decimals(0));
         ui.label(
             egui::RichText::new(if n == 0 {
                 "Click to place points on the mesh or the UV map. Try a stitch brush tip."
             } else {
-                "Drag points to shape · right-click removes · Backspace removes the last"
+                "Drag points to shape · click the curve to add one · right-click removes · Backspace removes the last"
             })
             .small()
             .color(theme::TEXT_DIM),
@@ -376,7 +478,7 @@ impl PainterApp {
         }
         if back {
             self.path.points.pop();
-            self.path.applied = false;
+            self.path.edited();
             if self.path.points.is_empty() {
                 self.path.view = None;
             }
@@ -401,6 +503,19 @@ mod tests {
             // Along the path the distance is exactly the step; across the corner it's shorter.
             assert!(w[0].0.distance(w[1].0) <= 3.0 + 1e-4);
         }
+    }
+
+    #[test]
+    fn a_point_picked_on_the_curve_goes_between_its_neighbours() {
+        let mut t = PathTool::default();
+        t.points = vec![PathPoint::Uv(Vec2::new(0.0, 0.0)), PathPoint::Uv(Vec2::new(1.0, 0.0)), PathPoint::Uv(Vec2::new(2.0, 0.0))];
+        t.smooth = false;
+        let line: Vec<Vec2> = t.curve().into_iter().map(|p| p.vec().truncate() * 100.0).collect();
+        let (k, d) = nearest_sample(&line, Vec2::new(150.0, 3.0)).unwrap();
+        assert!(d < 3.5, "{d}");
+        assert_eq!(insert_index(k, t.points.len()), 2, "between the second and third point");
+        let (k, _) = nearest_sample(&line, Vec2::new(20.0, -2.0)).unwrap();
+        assert_eq!(insert_index(k, t.points.len()), 1, "between the first two");
     }
 
     #[test]
