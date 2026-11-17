@@ -2,18 +2,6 @@
 
 use eframe::wgpu;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static ALLOCATION_FAILED: AtomicBool = AtomicBool::new(false);
-
-fn note_allocation_failed() {
-    ALLOCATION_FAILED.store(true, Ordering::Relaxed);
-}
-
-/// Whether a texture allocation has failed since the last call, and clears the flag.
-pub fn take_allocation_failed() -> bool {
-    ALLOCATION_FAILED.swap(false, Ordering::Relaxed)
-}
 
 /// A texture and its views. Clones share the GPU texture.
 #[derive(Clone)]
@@ -60,15 +48,7 @@ impl Tex {
         format: wgpu::TextureFormat,
         usage: wgpu::TextureUsages,
     ) -> Tex {
-        match Self::try_new(device, label, width, height, format, usage) {
-            Ok(tex) => tex,
-            Err(_) => {
-                note_allocation_failed();
-                // A 1x1 stand-in keeps the caller from touching an invalid
-                // texture. The open path retries at a smaller size when this trips.
-                Self::new_ms(device, label, 1, 1, format, usage, 1)
-            }
-        }
+        Self::new_ms(device, label, width, height, format, usage, 1)
     }
 
     pub fn new_ms(

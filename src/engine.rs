@@ -1227,23 +1227,56 @@ pub struct Engine {
     pub generation: u64,
 }
 
-fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> [Tex; ACCUM] {
-    ACCUM_FORMATS.map(|f| Tex::new(device, label, res, res, f, LAYER_USAGE))
+fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> Result<[Tex; ACCUM], String> {
+    Ok([
+        Tex::try_new(device, label, res, res, ACCUM_FORMATS[0], LAYER_USAGE)?,
+        Tex::try_new(device, label, res, res, ACCUM_FORMATS[1], LAYER_USAGE)?,
+        Tex::try_new(device, label, res, res, ACCUM_FORMATS[2], LAYER_USAGE)?,
+        Tex::try_new(device, label, res, res, ACCUM_FORMATS[3], LAYER_USAGE)?,
+        Tex::try_new(device, label, res, res, ACCUM_FORMATS[4], LAYER_USAGE)?,
+        Tex::try_new(device, label, res, res, ACCUM_FORMATS[5], LAYER_USAGE)?,
+        Tex::try_new(device, label, res, res, ACCUM_FORMATS[6], LAYER_USAGE)?,
+    ])
 }
 
-/// Nearest-neighbor downsample of tightly packed texels. Used so a Painter
-/// channel is uploaded at the document size instead of allocating the full
-/// source texture first.
-fn downscale_texels(src: &[u8], size: u32, target: u32, bpp: u32) -> Vec<u8> {
-    let bpp = bpp as usize;
+/// Box-filters tightly packed texels down to `target`. Used only when a
+/// Painter channel is larger than the texture set it is being opened into.
+fn downscale_texels(src: &[u8], size: u32, target: u32, format: F) -> Vec<u8> {
+    let bpp = gpu::bytes_per_texel(format) as usize;
+    let f16 = matches!(format, F::R16Float | F::Rg16Float | F::Rgba16Float);
     let mut out = vec![0u8; (target * target) as usize * bpp];
     for y in 0..target {
+        let y0 = y as u64 * size as u64 / target as u64;
+        let y1 = ((y as u64 + 1) * size as u64 / target as u64).max(y0 + 1).min(size as u64);
         for x in 0..target {
-            let sx = x as u64 * size as u64 / target as u64;
-            let sy = y as u64 * size as u64 / target as u64;
-            let si = ((sy * size as u64 + sx) as usize) * bpp;
+            let x0 = x as u64 * size as u64 / target as u64;
+            let x1 = ((x as u64 + 1) * size as u64 / target as u64).max(x0 + 1).min(size as u64);
+            let n = ((x1 - x0) * (y1 - y0)) as f32;
             let di = ((y * target + x) as usize) * bpp;
-            out[di..di + bpp].copy_from_slice(&src[si..si + bpp]);
+            if f16 {
+                for c in 0..bpp / 2 {
+                    let mut acc = 0.0f32;
+                    for sy in y0..y1 {
+                        for sx in x0..x1 {
+                            let si = ((sy * size as u64 + sx) as usize) * bpp + c * 2;
+                            acc += gpu::f16_to_f32(u16::from_le_bytes([src[si], src[si + 1]]));
+                        }
+                    }
+                    let bits = gpu::f32_to_f16(acc / n).to_le_bytes();
+                    out[di + c * 2] = bits[0];
+                    out[di + c * 2 + 1] = bits[1];
+                }
+            } else {
+                for c in 0..bpp {
+                    let mut acc = 0u32;
+                    for sy in y0..y1 {
+                        for sx in x0..x1 {
+                            acc += src[((sy * size as u64 + sx) as usize) * bpp + c] as u32;
+                        }
+                    }
+                    out[di + c] = (acc as f32 / n).round() as u8;
+                }
+            }
         }
     }
     out
@@ -1253,12 +1286,12 @@ impl Engine {
     /// A document of one texture set covering the whole mesh.
     pub fn new(rs: &egui_wgpu::RenderState, mesh: &GpuMesh, bounds: (Vec3, Vec3), res: u32) -> Engine {
         let p = Arc::new(Self::create_pipelines(&rs.device));
-        Self::with_pipelines(rs, p, mesh, 0..mesh.index_count, bounds, res)
+        Self::with_pipelines(rs, p, mesh, 0..mesh.index_count, bounds, res).expect("not enough GPU memory to create a texture set")
     }
 
     /// Another texture set of the same document: `tris` is its range in the
     /// mesh's index buffer. Shares this engine's pipelines.
-    pub fn sibling(&self, mesh: &GpuMesh, tris: std::ops::Range<u32>, res: u32) -> Engine {
+    pub fn try_sibling(&self, mesh: &GpuMesh, tris: std::ops::Range<u32>, res: u32) -> Result<Engine, String> {
         Self::with_pipelines(&self.rs, self.p.clone(), mesh, tris, self.bounds, res)
     }
 
@@ -1269,7 +1302,7 @@ impl Engine {
         tris: std::ops::Range<u32>,
         bounds: (Vec3, Vec3),
         res: u32,
-    ) -> Engine {
+    ) -> Result<Engine, String> {
         let device = rs.device.clone();
         let queue = rs.queue.clone();
         let sampler = gpu::linear_sampler(&device, wgpu::AddressMode::ClampToEdge);
@@ -1295,12 +1328,12 @@ impl Engine {
 
         let mut engine = Engine {
             rs: rs.clone(),
-            pos: Tex::new(&device, "position map", res, res, POS_FORMAT, LAYER_USAGE),
-            nrm: Tex::new(&device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE),
-            tan: Tex::new(&device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE),
-            accum: [accum_set(&device, res, "accum A"), accum_set(&device, res, "accum B")],
+            pos: Tex::try_new(&device, "position map", res, res, POS_FORMAT, LAYER_USAGE)?,
+            nrm: Tex::try_new(&device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE)?,
+            tan: Tex::try_new(&device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE)?,
+            accum: [accum_set(&device, res, "accum A")?, accum_set(&device, res, "accum B")?],
             final_idx: 0,
-            stroke: Tex::new(&device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE),
+            stroke: Tex::try_new(&device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE)?,
             snap: Default::default(),
             snap_mask: None,
             maps,
@@ -1370,9 +1403,9 @@ impl Engine {
             device,
             queue,
         };
-        engine.bake_uv(mesh);
+        engine.bake_uv(mesh)?;
         engine.committed = engine.doc_props();
-        engine
+        Ok(engine)
     }
 
     fn create_pipelines(device: &wgpu::Device) -> Pipelines {
@@ -1750,14 +1783,14 @@ impl Engine {
 
     /// Rasterizes position and normal maps for the current mesh at the
     /// current resolution, with dilation past UV island borders.
-    pub fn bake_uv(&mut self, mesh: &GpuMesh) {
+    pub fn bake_uv(&mut self, mesh: &GpuMesh) -> Result<(), String> {
         // A mesh change can leave the range past the end; the app sets the
         // new range right after, and this draws nothing meanwhile.
         let tris = self.tris.start.min(mesh.index_count)..self.tris.end.min(mesh.index_count);
         let device = &self.device;
-        let tmp_pos = Tex::new(device, "dilate pos", self.res, self.res, POS_FORMAT, LAYER_USAGE);
-        let tmp_nrm = Tex::new(device, "dilate nrm", self.res, self.res, NRM_FORMAT, LAYER_USAGE);
-        let tmp_tan = Tex::new(device, "dilate tan", self.res, self.res, TAN_FORMAT, LAYER_USAGE);
+        let tmp_pos = Tex::try_new(device, "dilate pos", self.res, self.res, POS_FORMAT, LAYER_USAGE)?;
+        let tmp_nrm = Tex::try_new(device, "dilate nrm", self.res, self.res, NRM_FORMAT, LAYER_USAGE)?;
+        let tmp_tan = Tex::try_new(device, "dilate tan", self.res, self.res, TAN_FORMAT, LAYER_USAGE)?;
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
@@ -1809,6 +1842,7 @@ impl Engine {
         self.queue.submit([encoder.finish()]);
         self.uv_version += 1;
         self.mark_dirty();
+        Ok(())
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -1822,9 +1856,9 @@ impl Engine {
 
     /// Moves the texture set to another range of the (new) mesh and remakes
     /// its position and normal maps.
-    pub fn set_triangles(&mut self, tris: std::ops::Range<u32>, mesh: &GpuMesh) {
+    pub fn set_triangles(&mut self, tris: std::ops::Range<u32>, mesh: &GpuMesh) -> Result<(), String> {
         self.tris = tris;
-        self.bake_uv(mesh);
+        self.bake_uv(mesh)
     }
 
     pub fn set_bounds(&mut self, bounds: (Vec3, Vec3)) {
@@ -2472,7 +2506,7 @@ impl Engine {
         name: String,
         channels: [Option<(u32, Vec<u8>)>; CHANNELS],
         undo: &mut UndoStack,
-    ) -> usize {
+    ) -> Result<usize, String> {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut chans: [Option<Tex>; CHANNELS] = Default::default();
         for (ch, data) in channels.into_iter().enumerate() {
@@ -2482,12 +2516,8 @@ impl Engine {
                 continue;
             }
             let src_size = self.res.min(size);
-            let texels = if src_size == size {
-                texels
-            } else {
-                downscale_texels(&texels, size, src_size, gpu::bytes_per_texel(format))
-            };
-            let src = Tex::new(&self.device, CH_NAMES[ch], src_size, src_size, format, LAYER_USAGE);
+            let texels = if src_size == size { texels } else { downscale_texels(&texels, size, src_size, format) };
+            let src = Tex::try_new(&self.device, CH_NAMES[ch], src_size, src_size, format, LAYER_USAGE)?;
             let layout = wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(src_size * gpu::bytes_per_texel(format)),
@@ -2510,7 +2540,7 @@ impl Engine {
             images: Default::default(),
             thumb,
         };
-        self.insert_layer(at, layer, undo, "Add paint layer".into())
+        Ok(self.insert_layer(at, layer, undo, "Add paint layer".into()))
     }
 
     pub fn add_fill_layer(
@@ -4192,9 +4222,9 @@ impl Engine {
     }
 
     /// Changes the texture set resolution, resampling every painted texture.
-    pub fn set_resolution(&mut self, res: u32, mesh: &GpuMesh, undo: &mut UndoStack) {
+    pub fn set_resolution(&mut self, res: u32, mesh: &GpuMesh, undo: &mut UndoStack) -> Result<(), String> {
         if res == self.res || self.active.is_some() {
-            return;
+            return Ok(());
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut new_layers = Vec::with_capacity(self.layers.len());
@@ -4240,15 +4270,15 @@ impl Engine {
         }
         self.res = res;
         self.uv_version += 1;
-        self.pos = Tex::new(&self.device, "position map", res, res, POS_FORMAT, LAYER_USAGE);
-        self.nrm = Tex::new(&self.device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE);
-        self.tan = Tex::new(&self.device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE);
-        self.accum = [accum_set(&self.device, res, "accum A"), accum_set(&self.device, res, "accum B")];
-        self.stroke = Tex::new(&self.device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE);
+        self.pos = Tex::try_new(&self.device, "position map", res, res, POS_FORMAT, LAYER_USAGE)?;
+        self.nrm = Tex::try_new(&self.device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE)?;
+        self.tan = Tex::try_new(&self.device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE)?;
+        self.accum = [accum_set(&self.device, res, "accum A")?, accum_set(&self.device, res, "accum B")?];
+        self.stroke = Tex::try_new(&self.device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE)?;
         self.snap = Default::default();
         self.snap_mask = None;
         undo.clear();
-        self.bake_uv(mesh);
+        self.bake_uv(mesh)
     }
 
     // ------------------------------------------------------------------ stats

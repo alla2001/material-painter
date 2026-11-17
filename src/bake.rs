@@ -37,26 +37,6 @@ pub fn lower_bake_res(res: u32) -> Option<u32> {
     (next >= MIN_BAKE_RES).then_some(next)
 }
 
-/// Largest document resolution at which `sets` texture sets plus one bake
-/// stay inside a budget that still leaves room for the mesh on a 16 GB GPU.
-pub fn fit_document_resolution(requested: u32, sets: usize) -> u32 {
-    let sets = sets.max(1) as u64;
-    let mut res = requested.min(MAX_BAKE_RES).max(MIN_BAKE_RES);
-    // Document textures are about 96 bytes a texel per set; the bake adds
-    // about 256. 4 GB leaves the rest of a 16 GB card for the mesh and desktop.
-    const BUDGET: u64 = 4 << 30;
-    const PER_SET: u64 = 96;
-    const BAKE: u64 = 256;
-    while res > MIN_BAKE_RES {
-        let texels = res as u64 * res as u64;
-        if texels.saturating_mul(PER_SET * sets + BAKE) <= BUDGET {
-            break;
-        }
-        res /= 2;
-    }
-    res
-}
-
 /// How many packed map textures a bake makes (see `engine::MAPS`).
 pub const MAP_TEXTURES: usize = 5;
 
@@ -2363,9 +2343,6 @@ pub(crate) mod tests {
         assert_eq!(lower_bake_res(1024), Some(512));
         assert_eq!(lower_bake_res(512), None);
         assert_eq!(lower_bake_res(600), None);
-        assert_eq!(fit_document_resolution(4096, 1), 2048);
-        assert_eq!(fit_document_resolution(2048, 1), 2048);
-        assert!(fit_document_resolution(4096, 16) <= 1024);
     }
     use crate::engine::{MAPS, MapKind};
     use crate::gpu::{GpuMesh, f16_to_f32, read_texture};

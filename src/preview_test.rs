@@ -1677,8 +1677,8 @@ fn texture_sets_paint_apart() {
     let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
     let res = 256;
     let mut left = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
-    left.set_triangles(mesh.sets[0].index_range(), &gpu_mesh);
-    let mut right = left.sibling(&gpu_mesh, mesh.sets[1].index_range(), res);
+    left.set_triangles(mesh.sets[0].index_range(), &gpu_mesh).expect("uv maps");
+    let mut right = left.try_sibling(&gpu_mesh, mesh.sets[1].index_range(), res).expect("texture set");
     let mut undo = UndoStack::default();
     left.add_paint_layer(0, None, None, &mut undo);
     let blue = MatValues { color: [0.05, 0.1, 0.9], ..Default::default() };
@@ -2220,8 +2220,8 @@ fn transparency_paints_shows_and_exports() {
     let gpu_mesh = GpuMesh::new(&rs.device, &mesh);
     let res = 256;
     let mut left = Engine::new(&rs, &gpu_mesh, (mesh.bounds_min, mesh.bounds_max), res);
-    left.set_triangles(mesh.sets[0].index_range(), &gpu_mesh);
-    let mut right = left.sibling(&gpu_mesh, mesh.sets[1].index_range(), res);
+    left.set_triangles(mesh.sets[0].index_range(), &gpu_mesh).expect("uv maps");
+    let mut right = left.try_sibling(&gpu_mesh, mesh.sets[1].index_range(), res).expect("texture set");
     let mut undo = UndoStack::default();
     // Left: opaque red, with a paint layer on top. Right: blue at opacity 0.
     let red = MatValues { color: [0.9, 0.1, 0.05], ..Default::default() };

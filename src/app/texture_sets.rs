@@ -118,7 +118,7 @@ impl PainterApp {
     /// one in order; new sets start with one paint layer, at `sizes[k]` when
     /// given (a project or import about to fill them), else the default
     /// size. The edited set stays edited when it survives.
-    pub(super) fn rebuild_sets(&mut self, old_names: &[String], sizes: &[u32]) {
+    pub(super) fn rebuild_sets(&mut self, old_names: &[String], sizes: &[u32]) -> Result<(), String> {
         let new: Vec<(String, std::ops::Range<u32>)> =
             self.mesh.sets.iter().map(|s| (s.name.clone(), s.index_range())).collect();
         let mut used = vec![false; old_names.len()];
@@ -143,10 +143,10 @@ impl PainterApp {
         // Made at their final size: making every set at the default size and
         // resizing it after costs several sets' worth of GPU memory at once.
         let size = |k: usize| sizes.get(k).copied().unwrap_or(self.prefs.default_resolution);
-        let fresh = |engine: &Engine, range: std::ops::Range<u32>, mesh: &crate::gpu::GpuMesh, res: u32| {
-            let mut e = engine.sibling(mesh, range, res);
+        let fresh = |engine: &Engine, range: std::ops::Range<u32>, mesh: &crate::gpu::GpuMesh, res: u32| -> Result<Parked, String> {
+            let mut e = engine.try_sibling(mesh, range, res)?;
             e.add_paint_layer(0, None, None, &mut UndoStack::default());
-            Parked { engine: e, selected: 0, target: StrokeTarget::Content }
+            Ok(Parked { engine: e, selected: 0, target: StrokeTarget::Content })
         };
         let mut parked = Vec::with_capacity(new.len());
         for (i, (_, range)) in new.iter().enumerate() {
@@ -157,14 +157,14 @@ impl PainterApp {
             let kept = assign[i].filter(|&j| j != old_active).and_then(|j| old[j].take());
             let p = match kept {
                 Some(p) => p,
-                None => fresh(&self.engine, range.clone(), &self.gpu_mesh, size(i)),
+                None => fresh(&self.engine, range.clone(), &self.gpu_mesh, size(i))?,
             };
             parked.push(Some(p));
         }
         if assign[active] != Some(old_active) {
             let p = match assign[active].and_then(|j| old[j].take()) {
                 Some(p) => p,
-                None => fresh(&self.engine, new[active].1.clone(), &self.gpu_mesh, size(active)),
+                None => fresh(&self.engine, new[active].1.clone(), &self.gpu_mesh, size(active))?,
             };
             self.engine = p.engine;
             self.selected = p.selected;
@@ -191,11 +191,12 @@ impl PainterApp {
                 None => &mut self.engine,
             };
             e.set_bounds(bounds);
-            e.set_triangles(range, gpu_mesh);
+            e.set_triangles(range, gpu_mesh)?;
         }
         for d in &mut self.graphs.docs {
             d.dirty = true;
         }
+        Ok(())
     }
 
     /// Flashes texture set `k` in the 3D view, to show which part of the mesh it is.

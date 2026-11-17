@@ -1522,8 +1522,8 @@ impl PainterApp {
     // ------------------------------------------------------------------ jobs
 
     /// Starts the GPU bake of `scene` at `res`, stepping down when the working
-    /// set does not fit. The texture set still receives full-resolution maps:
-    /// [`Engine::set_maps`] upscales a smaller bake.
+    /// set does not fit. A smaller bake is upscaled to the texture set's size
+    /// (see [`Engine::set_maps`]).
     fn launch_bake(&mut self, scene: PreparedScene, mut res: u32, ctx: &egui::Context) {
         let set = self.sets.baking;
         let full = self.set_engines().get(set).map_or(res, |e| e.res).min(bake::MAX_BAKE_RES);
@@ -1747,14 +1747,16 @@ impl PainterApp {
     }
 
     fn load_mesh(&mut self, mesh: Mesh, ctx: &egui::Context) {
-        self.load_mesh_sized(mesh, ctx, &[]);
+        if let Err(e) = self.load_mesh_sized(mesh, ctx, &[]) {
+            self.status = e;
+        }
     }
 
     /// Loads `mesh`, making its new texture sets at `sizes` (per set, in
     /// order) instead of the default size.
-    fn load_mesh_sized(&mut self, mesh: Mesh, ctx: &egui::Context, sizes: &[u32]) {
+    fn load_mesh_sized(&mut self, mesh: Mesh, ctx: &egui::Context, sizes: &[u32]) -> Result<(), String> {
         if self.stroke.is_some() {
-            return;
+            return Ok(());
         }
         // A bake of the old mesh can't land on the new one.
         self.bake_job = None;
@@ -1770,7 +1772,7 @@ impl PainterApp {
         };
         let old_names: Vec<String> = self.mesh.sets.iter().map(|s| s.name.clone()).collect();
         self.mesh = Arc::new(mesh);
-        self.rebuild_sets(&old_names, sizes);
+        self.rebuild_sets(&old_names, sizes)?;
         // Mesh-dependent helpers rebuild for the new mesh on demand.
         self.poly.topo = None;
         self.poly.shown = None;
@@ -1783,6 +1785,7 @@ impl PainterApp {
         if self.prefs.bake_on_load {
             self.start_bake_all(ctx);
         }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ actions
@@ -1989,13 +1992,16 @@ impl PainterApp {
                     }
                 }
                 Action::SetResolution(r) => {
-                    self.engine.set_resolution(r, &self.gpu_mesh, &mut self.undo);
-                    self.repush_graphs();
-                    if self.engine.has_bake {
-                        // Mesh maps are baked at the texture set size; refresh them.
-                        self.start_bake(ctx);
+                    if let Err(e) = self.engine.set_resolution(r, &self.gpu_mesh, &mut self.undo) {
+                        self.status = e;
+                    } else {
+                        self.repush_graphs();
+                        if self.engine.has_bake {
+                            // Mesh maps are baked at the texture set size; refresh them.
+                            self.start_bake(ctx);
+                        }
+                        self.status = format!("Texture set resolution: {r}x{r}.");
                     }
-                    self.status = format!("Texture set resolution: {r}x{r}.");
                 }
                 Action::Bake => self.start_bake(ctx),
                 Action::BakeAll => self.start_bake_all(ctx),
@@ -2031,7 +2037,9 @@ impl PainterApp {
                 }
                 self.graphs.clear(&self.rs);
                 if self.engine.res != self.prefs.default_resolution {
-                    self.engine.set_resolution(self.prefs.default_resolution, &self.gpu_mesh, &mut self.undo);
+                    if let Err(e) = self.engine.set_resolution(self.prefs.default_resolution, &self.gpu_mesh, &mut self.undo) {
+                        self.status = e;
+                    }
                 }
                 self.selected = self.engine.add_paint_layer(0, None, None, &mut self.undo);
                 self.undo.clear();

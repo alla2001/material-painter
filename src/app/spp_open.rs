@@ -301,25 +301,32 @@ impl PainterApp {
         let Imported { mesh, sets, came, left, to_mesh, mesh_scale, images } = imported;
         self.graphs.clear(&self.rs);
         self.apply_project_defaults();
-        let set_count = sets.len().max(mesh.sets.len());
-        let mut attempt = 0u32;
+        let mut shrink = 0u32;
         let (sizes, stack) = loop {
-            let _ = crate::gpu::take_allocation_failed();
             let sizes: Vec<u32> = sets
                 .iter()
                 .map(|s| {
-                    let mut r = crate::bake::fit_document_resolution(s.resolution, set_count);
-                    for _ in 0..attempt {
+                    let mut r = s.resolution.clamp(crate::bake::MIN_BAKE_RES, crate::spp_import::MAX_RESOLUTION);
+                    for _ in 0..shrink {
                         r = crate::bake::lower_bake_res(r).unwrap_or(r);
                     }
                     r
                 })
                 .collect();
-            self.load_mesh_sized(mesh.clone(), ctx, &sizes);
+            if let Err(e) = self.load_mesh_sized(mesh.clone(), ctx, &sizes) {
+                if !crate::gpu::allocation_failed(&e) || sizes.iter().all(|r| *r <= crate::bake::MIN_BAKE_RES) || shrink >= 3 {
+                    self.status = e;
+                    return;
+                }
+                let _ = self.rs.device.poll(eframe::wgpu::PollType::wait_indefinitely());
+                shrink += 1;
+                continue;
+            }
+            // Layers are filled below; the bake starts once that succeeds.
             self.bake_job = None;
             self.bake_res_override = None;
             let mut stack = Rebuilt::default();
-            let mut stack_ok = true;
+            let mut failed: Option<String> = None;
             let topo = self.poly_topology();
             for (k, set) in sets.iter().enumerate() {
                 self.switch_set(k);
@@ -329,13 +336,18 @@ impl PainterApp {
                 }
                 let res = sizes[k];
                 if self.engine.res != res {
-                    self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo);
+                    if let Err(e) = self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo) {
+                        failed = Some(e);
+                        break;
+                    }
                 }
-                if crate::gpu::take_allocation_failed() {
-                    stack_ok = false;
-                    break;
-                }
-                let flat = self.engine.add_paint_layer_from(0, None, FLATTENED.into(), set.channels.clone(), &mut self.undo);
+                let flat = match self.engine.add_paint_layer_from(0, None, FLATTENED.into(), set.channels.clone(), &mut self.undo) {
+                    Ok(flat) => flat,
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                };
                 let replay = Replay {
                     to_mesh,
                     scale: mesh_scale,
@@ -347,20 +359,17 @@ impl PainterApp {
                 self.engine.set_mask_over(false);
                 self.selected = self.engine.layers.iter().position(|l| l.name == FLATTENED).unwrap_or(flat);
                 self.target = StrokeTarget::Content;
-                if crate::gpu::take_allocation_failed() {
-                    stack_ok = false;
-                    break;
+            }
+            if let Some(e) = failed {
+                if !crate::gpu::allocation_failed(&e) || sizes.iter().all(|r| *r <= crate::bake::MIN_BAKE_RES) || shrink >= 3 {
+                    self.status = e;
+                    return;
                 }
+                let _ = self.rs.device.poll(eframe::wgpu::PollType::wait_indefinitely());
+                shrink += 1;
+                continue;
             }
-            if stack_ok {
-                break (sizes, stack);
-            }
-            let _ = self.rs.device.poll(eframe::wgpu::PollType::wait_indefinitely());
-            let at_floor = sizes.iter().all(|r| *r <= crate::bake::MIN_BAKE_RES);
-            if at_floor || attempt >= 3 {
-                break (sizes, stack);
-            }
-            attempt += 1;
+            break (sizes, stack);
         };
         self.switch_set(0);
         self.undo.clear();
