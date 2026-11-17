@@ -183,7 +183,9 @@ impl PainterApp {
         if let Some(saved) = self.bake_preview.saved.take() {
             if restore {
                 match saved {
-                    Some((maps, report)) => self.engine.set_maps(maps, report),
+                    Some((maps, report)) => {
+                        self.engine.set_maps(maps, report);
+                    }
                     None => self.engine.clear_maps(),
                 }
             }

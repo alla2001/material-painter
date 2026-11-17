@@ -1994,17 +1994,42 @@ impl Engine {
 
     /// Adopts freshly baked maps. Painted fixes and levels are kept, so artists
     /// can re-bake with new settings without losing their corrections.
-    pub fn set_maps(&mut self, baked: BakedMaps, report: Arc<BakeReport>) {
+    ///
+    /// Returns whether the stored maps match the texture set's size. A bake
+    /// smaller than the set is upscaled when that fits; otherwise the smaller
+    /// maps are kept.
+    pub fn set_maps(&mut self, baked: BakedMaps, report: Arc<BakeReport>) -> bool {
         // Bakes stop at `bake::MAX_BAKE_RES`; bigger texture sets get them upscaled.
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let BakedMaps { maps, custom } = baked;
         let (maps, custom) = if maps[0].width < self.res {
-            let up = maps.each_ref().map(|m| self.resample(&mut encoder, m, self.res));
-            let custom = custom.iter().map(|m| self.resample(&mut encoder, m, self.res)).collect();
-            (up, custom)
+            let attempt: Result<([Tex; MAP_TEXTURES], Vec<Tex>), String> = (|| {
+                let up = [
+                    self.resample(&mut encoder, &maps[0], self.res)?,
+                    self.resample(&mut encoder, &maps[1], self.res)?,
+                    self.resample(&mut encoder, &maps[2], self.res)?,
+                    self.resample(&mut encoder, &maps[3], self.res)?,
+                    self.resample(&mut encoder, &maps[4], self.res)?,
+                ];
+                let mut custom_up = Vec::with_capacity(custom.len());
+                for m in &custom {
+                    custom_up.push(self.resample(&mut encoder, m, self.res)?);
+                }
+                Ok((up, custom_up))
+            })();
+            match attempt {
+                Ok(upscaled) => upscaled,
+                Err(_) => {
+                    // The upsample draws reference textures we are about to drop.
+                    drop(encoder);
+                    encoder = self.device.create_command_encoder(&Default::default());
+                    (maps, custom)
+                }
+            }
         } else {
             (maps, custom)
         };
+        let at_set_size = maps[0].width == self.res;
         self.custom = custom;
         self.custom_ids = report.custom.clone();
         self.build_custom_array(&mut encoder);
@@ -2018,6 +2043,7 @@ impl Engine {
         self.has_bake = true;
         self.maps_dirty = true;
         self.mark_dirty();
+        at_set_size
     }
 
     /// Fills a fill layer's image slots from a material graph's outputs
@@ -2524,7 +2550,7 @@ impl Engine {
                 rows_per_image: Some(src_size),
             };
             self.queue.write_texture(src.copy_info(), &texels, layout, src.extent());
-            chans[ch] = Some(if src_size == self.res { src } else { self.resample(&mut encoder, &src, self.res) });
+            chans[ch] = Some(if src_size == self.res { src } else { self.resample(&mut encoder, &src, self.res)? });
         }
         self.queue.submit([encoder.finish()]);
         let thumb = chans[0].as_ref().map(|c| self.rs.renderer.write().register_native_texture(&self.device, c.srgb(), wgpu::FilterMode::Linear));
@@ -4203,8 +4229,8 @@ impl Engine {
         pass.draw(0..3, 0..1);
     }
 
-    fn resample(&self, encoder: &mut wgpu::CommandEncoder, src: &Tex, res: u32) -> Tex {
-        let dst = Tex::new(&self.device, "resampled", res, res, src.format, LAYER_USAGE);
+    fn resample(&self, encoder: &mut wgpu::CommandEncoder, src: &Tex, res: u32) -> Result<Tex, String> {
+        let dst = Tex::try_new(&self.device, "resampled", res, res, src.format, LAYER_USAGE)?;
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.p.resample_bgl,
@@ -4218,7 +4244,7 @@ impl Engine {
         pass.set_bind_group(0, &bg, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);
-        dst
+        Ok(dst)
     }
 
     /// Changes the texture set resolution, resampling every painted texture.
@@ -4226,29 +4252,60 @@ impl Engine {
         if res == self.res || self.active.is_some() {
             return Ok(());
         }
+        // Surface textures first. A failure here has not changed the document.
+        let pos = Tex::try_new(&self.device, "position map", res, res, POS_FORMAT, LAYER_USAGE)?;
+        let nrm = Tex::try_new(&self.device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE)?;
+        let tan = Tex::try_new(&self.device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE)?;
+        let accum = [accum_set(&self.device, res, "accum A")?, accum_set(&self.device, res, "accum B")?];
+        let stroke = Tex::try_new(&self.device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE)?;
+
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut new_layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let content = match &layer.content {
-                Content::Paint(ch) => Some(std::array::from_fn(|i| ch[i].as_ref().map(|t| self.resample(&mut encoder, t, res)))),
+                Content::Paint(ch) => {
+                    let mut next: [Option<Tex>; CHANNELS] = std::array::from_fn(|_| None);
+                    for (i, tex) in ch.iter().enumerate() {
+                        if let Some(tex) = tex {
+                            next[i] = Some(self.resample(&mut encoder, tex, res)?);
+                        }
+                    }
+                    Some(next)
+                }
                 Content::Fill(_) | Content::Folder(_) => None,
             };
-            let mask = layer.mask.as_ref().and_then(|m| m.paint.as_ref()).map(|t| self.resample(&mut encoder, t, res));
+            let mask = match layer.mask.as_ref().and_then(|m| m.paint.as_ref()) {
+                Some(t) => Some(self.resample(&mut encoder, t, res)?),
+                None => None,
+            };
             new_layers.push((content, mask));
         }
-        if self.has_bake {
-            let maps = std::array::from_fn(|t| self.resample(&mut encoder, &self.maps[t], res));
-            self.maps = maps;
-            self.custom = self.custom.iter().map(|t| self.resample(&mut encoder, t, res)).collect();
-            self.build_custom_array(&mut encoder);
+        let baked_maps = if self.has_bake {
+            let mut next = Vec::with_capacity(self.maps.len());
+            for m in &self.maps {
+                next.push(self.resample(&mut encoder, m, res)?);
+            }
+            Some(next)
+        } else {
+            None
+        };
+        let baked_custom = if self.has_bake {
+            let mut next = Vec::with_capacity(self.custom.len());
+            for t in &self.custom {
+                next.push(self.resample(&mut encoder, t, res)?);
+            }
+            Some(next)
+        } else {
+            None
+        };
+        let mut fixes = Vec::with_capacity(self.map_fix.len());
+        for f in &self.map_fix {
+            fixes.push(match f {
+                Some(t) => Some(self.resample(&mut encoder, t, res)?),
+                None => None,
+            });
         }
-        let fixes: Vec<Option<Tex>> =
-            self.map_fix.iter().map(|f| f.as_ref().map(|t| self.resample(&mut encoder, t, res))).collect();
-        for (dst, f) in self.map_fix.iter_mut().zip(fixes) {
-            *dst = f;
-        }
-        self.resolved = Default::default();
-        self.maps_dirty = true;
+
         self.queue.submit([encoder.finish()]);
         for (layer, (content, mask)) in self.layers.iter_mut().zip(new_layers) {
             if let Some(ch) = content {
@@ -4268,13 +4325,28 @@ impl Engine {
                 }
             }
         }
+        if let Some(next) = baked_maps {
+            let next: [Tex; MAP_TEXTURES] = next.try_into().ok().expect("map count");
+            self.maps = next;
+        }
+        if let Some(next) = baked_custom {
+            self.custom = next;
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            self.build_custom_array(&mut encoder);
+            self.queue.submit([encoder.finish()]);
+        }
+        for (dst, f) in self.map_fix.iter_mut().zip(fixes) {
+            *dst = f;
+        }
+        self.resolved = Default::default();
+        self.maps_dirty = true;
         self.res = res;
         self.uv_version += 1;
-        self.pos = Tex::try_new(&self.device, "position map", res, res, POS_FORMAT, LAYER_USAGE)?;
-        self.nrm = Tex::try_new(&self.device, "normal map", res, res, NRM_FORMAT, LAYER_USAGE)?;
-        self.tan = Tex::try_new(&self.device, "tangent map", res, res, TAN_FORMAT, LAYER_USAGE)?;
-        self.accum = [accum_set(&self.device, res, "accum A")?, accum_set(&self.device, res, "accum B")?];
-        self.stroke = Tex::try_new(&self.device, "stroke mask", res, res, STROKE_FORMAT, LAYER_USAGE)?;
+        self.pos = pos;
+        self.nrm = nrm;
+        self.tan = tan;
+        self.accum = accum;
+        self.stroke = stroke;
         self.snap = Default::default();
         self.snap_mask = None;
         undo.clear();

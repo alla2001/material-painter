@@ -306,7 +306,7 @@ impl PainterApp {
             let sizes: Vec<u32> = sets
                 .iter()
                 .map(|s| {
-                    let mut r = s.resolution.clamp(crate::bake::MIN_BAKE_RES, crate::spp_import::MAX_RESOLUTION);
+                    let mut r = s.resolution.min(crate::spp_import::MAX_RESOLUTION);
                     for _ in 0..shrink {
                         r = crate::bake::lower_bake_res(r).unwrap_or(r);
                     }

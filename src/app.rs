@@ -1688,10 +1688,16 @@ impl PainterApp {
                             n => format!(", {n} parts matched by name"),
                         };
                         let set_res = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len()).get(self.sets.baking).map_or(self.engine.res, |e| e.res);
-                        let upscaled = if reduced && report.resolution < set_res {
-                            format!(", reduced to fit GPU memory and upscaled to {set_res}²")
-                        } else if report.resolution < set_res {
+                        bake_cache::store(key, &maps, report.clone(), &self.rs.device, &self.rs.queue);
+                        let at_set_size = if let Some(e) = self.set_engine_mut(self.sets.baking) {
+                            e.set_maps(maps, report.clone())
+                        } else {
+                            true
+                        };
+                        let fit = if report.resolution < set_res && at_set_size {
                             format!(", upscaled to {set_res}²")
+                        } else if report.resolution < set_res {
+                            format!(", kept at {}² because {set_res}² did not fit", report.resolution)
                         } else {
                             String::new()
                         };
@@ -1700,7 +1706,7 @@ impl PainterApp {
                             _ => String::new(),
                         };
                         self.status = format!(
-                            "Baked {} mesh maps{set_name} from {} ({} tris, {} parts{matched}{}) at {}²{upscaled}.",
+                            "Baked {} mesh maps{set_name} from {} ({} tris, {} parts{matched}{}) at {}²{fit}.",
                             report.baked.count_ones(),
                             report.source,
                             report.triangles,
@@ -1708,10 +1714,6 @@ impl PainterApp {
                             if report.used_cage { ", cage" } else { "" },
                             report.resolution
                         );
-                        bake_cache::store(key, &maps, report.clone(), &self.rs.device, &self.rs.queue);
-                        if let Some(e) = self.set_engine_mut(self.sets.baking) {
-                            e.set_maps(maps, report);
-                        }
                         self.bake_next(ctx);
                     }
                     Ok(Err(msg)) | Err(msg) if gpu::allocation_failed(&msg) => {
