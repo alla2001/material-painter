@@ -301,34 +301,67 @@ impl PainterApp {
         let Imported { mesh, sets, came, left, to_mesh, mesh_scale, images } = imported;
         self.graphs.clear(&self.rs);
         self.apply_project_defaults();
-        let sizes: Vec<u32> = sets.iter().map(|s| s.resolution).collect();
-        self.load_mesh_sized(mesh, ctx, &sizes);
-        let mut stack = Rebuilt::default();
-        // Recorded strokes go over the smart masks below them, as in Painter.
-        self.engine.set_mask_over(true);
-        let topo = self.poly_topology();
-        for (k, set) in sets.into_iter().enumerate() {
-            self.switch_set(k);
-            self.engine.set_mask_over(true);
-            while !self.engine.layers.is_empty() {
-                self.engine.delete_layer(0, &mut self.undo);
+        let set_count = sets.len().max(mesh.sets.len());
+        let mut attempt = 0u32;
+        let (sizes, stack) = loop {
+            let _ = crate::gpu::take_allocation_failed();
+            let sizes: Vec<u32> = sets
+                .iter()
+                .map(|s| {
+                    let mut r = crate::bake::fit_document_resolution(s.resolution, set_count);
+                    for _ in 0..attempt {
+                        r = crate::bake::lower_bake_res(r).unwrap_or(r);
+                    }
+                    r
+                })
+                .collect();
+            self.load_mesh_sized(mesh.clone(), ctx, &sizes);
+            self.bake_job = None;
+            self.bake_res_override = None;
+            let mut stack = Rebuilt::default();
+            let mut stack_ok = true;
+            let topo = self.poly_topology();
+            for (k, set) in sets.iter().enumerate() {
+                self.switch_set(k);
+                self.engine.set_mask_over(true);
+                while !self.engine.layers.is_empty() {
+                    self.engine.delete_layer(0, &mut self.undo);
+                }
+                let res = sizes[k];
+                if self.engine.res != res {
+                    self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo);
+                }
+                if crate::gpu::take_allocation_failed() {
+                    stack_ok = false;
+                    break;
+                }
+                let flat = self.engine.add_paint_layer_from(0, None, FLATTENED.into(), set.channels.clone(), &mut self.undo);
+                let replay = Replay {
+                    to_mesh,
+                    scale: mesh_scale,
+                    tris: self.mesh.sets.get(k).map_or(0..0, |s| s.tris.clone()),
+                    topo: topo.clone(),
+                    pad: self.prefs.poly_padding / self.engine.res as f32,
+                };
+                stack.add(self.rebuild_spp_stack(&set.layers, &replay, &images));
+                self.engine.set_mask_over(false);
+                self.selected = self.engine.layers.iter().position(|l| l.name == FLATTENED).unwrap_or(flat);
+                self.target = StrokeTarget::Content;
+                if crate::gpu::take_allocation_failed() {
+                    stack_ok = false;
+                    break;
+                }
             }
-            if self.engine.res != set.resolution {
-                self.engine.set_resolution(set.resolution, &self.gpu_mesh, &mut self.undo);
+            if stack_ok {
+                break (sizes, stack);
             }
-            let flat = self.engine.add_paint_layer_from(0, None, FLATTENED.into(), set.channels, &mut self.undo);
-            let replay = Replay {
-                to_mesh,
-                scale: mesh_scale,
-                tris: self.mesh.sets.get(k).map_or(0..0, |s| s.tris.clone()),
-                topo: topo.clone(),
-                pad: self.prefs.poly_padding / self.engine.res as f32,
-            };
-            stack.add(self.rebuild_spp_stack(&set.layers, &replay, &images));
-            self.engine.set_mask_over(false);
-            self.selected = self.engine.layers.iter().position(|l| l.name == FLATTENED).unwrap_or(flat);
-            self.target = StrokeTarget::Content;
-        }
+            let _ = self.rs.device.poll(eframe::wgpu::PollType::wait_indefinitely());
+            let at_floor = sizes.iter().all(|r| *r <= crate::bake::MIN_BAKE_RES);
+            if at_floor || attempt >= 3 {
+                break (sizes, stack);
+            }
+            attempt += 1;
+        };
         self.switch_set(0);
         self.undo.clear();
         self.saved_serial = self.undo.state_serial();
@@ -336,7 +369,14 @@ impl PainterApp {
         // Every set at its own size (set above), so after the sizes.
         self.start_bake_all(ctx);
         let name = path.file_name().map_or_else(|| self.mesh.name.clone(), |n| n.to_string_lossy().into_owned());
-        self.status = format!("Opened {name} from Substance 3D Painter: see the report for what came across.");
+        let reduced = sizes.iter().zip(sets.iter()).any(|(got, set)| *got < set.resolution);
+        let fit = if reduced {
+            let res = sizes.first().copied().unwrap_or(0);
+            format!(" Opened the texture sets at {res}² to fit in GPU memory.")
+        } else {
+            String::new()
+        };
+        self.status = format!("Opened {name} from Substance 3D Painter: see the report for what came across.{fit}");
         self.spp.report = Some(Report { name, came, left, stack });
     }
 

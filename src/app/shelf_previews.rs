@@ -75,7 +75,13 @@ impl ShelfPreviews {
             Stage::Preparing(rx) => match rx.try_recv() {
                 Ok(Ok(scene)) => {
                     let settings = BakeSettings { quality: Quality::Draft, ..Default::default() };
-                    let run = self.baker.start(&rs.device, &rs.queue, &self.mesh, &scene, &settings, RES);
+                    let run = match self.baker.start(&rs.device, &rs.queue, &self.mesh, &scene, &settings, RES) {
+                        Ok(run) => run,
+                        Err(e) => {
+                            eprintln!("shelf preview bake failed: {e}");
+                            return false;
+                        }
+                    };
                     self.stage = Stage::Baking(run);
                     ctx.request_repaint();
                     true
@@ -88,7 +94,14 @@ impl ShelfPreviews {
                 Err(mpsc::TryRecvError::Disconnected) => false,
             },
             Stage::Baking(run) => {
-                if let Some(maps) = self.baker.pump(run, &rs.device, &rs.queue, ctx) {
+                let pumped = match self.baker.pump(run, &rs.device, &rs.queue, ctx) {
+                    Ok(maps) => maps,
+                    Err(e) => {
+                        eprintln!("shelf preview bake failed: {e}");
+                        return false;
+                    }
+                };
+                if let Some(maps) = pumped {
                     let report = run.report.clone();
                     let mut engine = Engine::new(rs, &self.mesh, self.bounds, RES);
                     engine.set_maps(maps, report);

@@ -1231,6 +1231,24 @@ fn accum_set(device: &wgpu::Device, res: u32, label: &str) -> [Tex; ACCUM] {
     ACCUM_FORMATS.map(|f| Tex::new(device, label, res, res, f, LAYER_USAGE))
 }
 
+/// Nearest-neighbor downsample of tightly packed texels. Used so a Painter
+/// channel is uploaded at the document size instead of allocating the full
+/// source texture first.
+fn downscale_texels(src: &[u8], size: u32, target: u32, bpp: u32) -> Vec<u8> {
+    let bpp = bpp as usize;
+    let mut out = vec![0u8; (target * target) as usize * bpp];
+    for y in 0..target {
+        for x in 0..target {
+            let sx = x as u64 * size as u64 / target as u64;
+            let sy = y as u64 * size as u64 / target as u64;
+            let si = ((sy * size as u64 + sx) as usize) * bpp;
+            let di = ((y * target + x) as usize) * bpp;
+            out[di..di + bpp].copy_from_slice(&src[si..si + bpp]);
+        }
+    }
+    out
+}
+
 impl Engine {
     /// A document of one texture set covering the whole mesh.
     pub fn new(rs: &egui_wgpu::RenderState, mesh: &GpuMesh, bounds: (Vec3, Vec3), res: u32) -> Engine {
@@ -2463,10 +2481,20 @@ impl Engine {
             if texels.len() != (size * size * gpu::bytes_per_texel(format)) as usize {
                 continue;
             }
-            let src = Tex::new(&self.device, CH_NAMES[ch], size, size, format, LAYER_USAGE);
-            let layout = wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * gpu::bytes_per_texel(format)), rows_per_image: Some(size) };
+            let src_size = self.res.min(size);
+            let texels = if src_size == size {
+                texels
+            } else {
+                downscale_texels(&texels, size, src_size, gpu::bytes_per_texel(format))
+            };
+            let src = Tex::new(&self.device, CH_NAMES[ch], src_size, src_size, format, LAYER_USAGE);
+            let layout = wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(src_size * gpu::bytes_per_texel(format)),
+                rows_per_image: Some(src_size),
+            };
             self.queue.write_texture(src.copy_info(), &texels, layout, src.extent());
-            chans[ch] = Some(if size == self.res { src } else { self.resample(&mut encoder, &src, self.res) });
+            chans[ch] = Some(if src_size == self.res { src } else { self.resample(&mut encoder, &src, self.res) });
         }
         self.queue.submit([encoder.finish()]);
         let thumb = chans[0].as_ref().map(|c| self.rs.renderer.write().register_native_texture(&self.device, c.srgb(), wgpu::FilterMode::Linear));
