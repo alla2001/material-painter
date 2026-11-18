@@ -11,7 +11,7 @@ use crate::engine::{
     Blend, BrushPaint, Content, Engine, FillParams, GEN_INPUTS, GenKind, Levels, MAPS, MapKind, MatValues, Stamp,
     StampUniform,
 };
-use crate::gpu::GpuMesh;
+use crate::gpu::{self, GpuMesh};
 use crate::icons;
 use crate::mesh::{Mesh, Primitive};
 use crate::polyfill::{FillMode, SelectOpts, Topology};
@@ -331,8 +331,16 @@ enum BakeJob {
     /// Worker thread is looking the bake up in the cache, or else loading the
     /// source and building the BVH.
     Preparing(mpsc::Receiver<Result<Prepared, String>>),
-    /// GPU passes in progress; the result is cached under the key.
-    Running(BakeRun, bake_cache::Key),
+    /// GPU passes in progress. `scene` is kept so a bake that does not fit
+    /// can start again at a lower resolution without rebuilding the BVH.
+    Running {
+        run: BakeRun,
+        key: bake_cache::Key,
+        scene: PreparedScene,
+        res: u32,
+        /// Below the texture set's bake size because a larger one did not fit.
+        reduced: bool,
+    },
 }
 
 enum Prepared {
@@ -458,6 +466,9 @@ pub struct PainterApp {
     stroke: Option<StrokeInput>,
     bake_settings: BakeSettings,
     bake_job: Option<BakeJob>,
+    /// Next bake starts at this resolution instead of the texture set's, after
+    /// a cached upload did not fit.
+    bake_res_override: Option<u32>,
     baker: GpuBaker,
     show_bake: bool,
     shelf: Shelf,
@@ -798,21 +809,6 @@ fn start_hdri_thumbs(ctx: &egui::Context, builtins: Vec<usize>) -> mpsc::Receive
         }
     });
     rx
-}
-
-/// Runs `f`, turning a GPU out-of-memory error it causes into a message
-/// instead of wgpu's default (a panic). Native error scopes resolve at once.
-fn out_of_memory_guard<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, String> {
-    use std::future::Future;
-    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    let value = f();
-    let mut pop = std::pin::pin!(scope.pop());
-    match pop.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
-        std::task::Poll::Ready(Some(_)) => {
-            Err("Not enough GPU memory to bake. Lower the texture set resolution or close other GPU-heavy apps.".into())
-        }
-        _ => Ok(value),
-    }
 }
 
 fn projection_combo(ui: &mut egui::Ui, id: &str, p: &mut BrushProjection) {
@@ -1441,6 +1437,7 @@ impl PainterApp {
             stroke: None,
             bake_settings: BakeSettings::default(),
             bake_job: None,
+            bake_res_override: None,
             baker,
             show_bake: false,
             shelf: Shelf { cat: ShelfCat::SmartMaterials, search: String::new(), kind: None, icon_size: 72.0, smart, materials, generators, brushes, textures },
@@ -1524,6 +1521,56 @@ impl PainterApp {
 
     // ------------------------------------------------------------------ jobs
 
+    /// Starts the GPU bake of `scene` at `res`, stepping down when the working
+    /// set does not fit. A smaller bake is upscaled to the texture set's size
+    /// (see [`Engine::set_maps`]).
+    fn launch_bake(&mut self, scene: PreparedScene, mut res: u32, ctx: &egui::Context) {
+        let set = self.sets.baking;
+        let full = self.set_engines().get(set).map_or(res, |e| e.res).min(bake::MAX_BAKE_RES);
+        res = res.min(full);
+        let mut reduced = res < full;
+        loop {
+            let (baker, rs, mesh, settings) = (&self.baker, &self.rs, &self.gpu_mesh, &self.bake_settings);
+            let started = gpu::capture(&rs.device, || baker.start(&rs.device, &rs.queue, mesh, &scene, settings, res));
+            match started {
+                Ok(Ok(run)) => {
+                    let key = bake_cache::key(&self.mesh, &self.bake_settings, res, set);
+                    if reduced {
+                        self.status = format!("Not enough GPU memory for a {full}² bake; baking mesh maps at {res}².");
+                    }
+                    self.bake_job = Some(BakeJob::Running { run, key, scene, res, reduced });
+                    ctx.request_repaint();
+                    return;
+                }
+                Ok(Err(msg)) | Err(msg) if gpu::allocation_failed(&msg) => {
+                    let _ = self.rs.device.poll(wgpu::PollType::wait_indefinitely());
+                    match bake::lower_bake_res(res) {
+                        Some(next) => {
+                            self.status = format!("Not enough GPU memory at {res}²; retrying the bake at {next}².");
+                            reduced = true;
+                            res = next;
+                        }
+                        None => {
+                            let msg = format!("Not enough GPU memory to bake mesh maps (tried down to {res}²). The project stays open without them.");
+                            self.fail_mcp_bake(&msg);
+                            self.status = msg;
+                            self.bake_job = None;
+                            self.bake_next(ctx);
+                            return;
+                        }
+                    }
+                }
+                Ok(Err(msg)) | Err(msg) => {
+                    self.fail_mcp_bake(&msg);
+                    self.status = msg;
+                    self.bake_job = None;
+                    self.bake_next(ctx);
+                    return;
+                }
+            }
+        }
+    }
+
     /// Bakes the texture set being edited.
     fn start_bake(&mut self, ctx: &egui::Context) {
         self.sets.bake_queue.clear();
@@ -1541,7 +1588,10 @@ impl PainterApp {
         if set == self.sets.active {
             self.preview_full_bake_started();
         }
-        let Some(res) = self.set_engine_mut(set).map(|e| e.res.min(bake::MAX_BAKE_RES)) else { return };
+        let Some(mut res) = self.set_engine_mut(set).map(|e| e.res.min(bake::MAX_BAKE_RES)) else { return };
+        if let Some(over) = self.bake_res_override.take() {
+            res = over.min(res).max(bake::MIN_BAKE_RES);
+        }
         self.sets.baking = set;
         let mesh = self.mesh.clone();
         let settings = self.bake_settings.clone();
@@ -1574,88 +1624,117 @@ impl PainterApp {
     }
 
     fn poll_bake(&mut self, ctx: &egui::Context) {
-        match &mut self.bake_job {
-            None => {}
-            Some(BakeJob::Preparing(rx)) => match rx.try_recv() {
+        let Some(job) = self.bake_job.take() else { return };
+        match job {
+            BakeJob::Preparing(rx) => match rx.try_recv() {
                 Ok(Ok(Prepared::Cached(entry))) => {
+                    let res = entry.report.resolution;
                     let rs = &self.rs;
-                    match out_of_memory_guard(&rs.device, || entry.upload(&rs.device, &rs.queue)) {
+                    match gpu::capture(&rs.device, || entry.upload(&rs.device, &rs.queue)) {
                         Ok((maps, report)) => {
                             self.status = format!("Loaded {} cached mesh maps ({}², from {}).", report.baked.count_ones(), report.resolution, report.source);
                             if let Some(e) = self.set_engine_mut(self.sets.baking) {
                                 e.set_maps(maps, Arc::new(report));
                             }
+                            self.bake_next(ctx);
+                        }
+                        Err(e) if gpu::allocation_failed(&e) => {
+                            let _ = self.rs.device.poll(wgpu::PollType::wait_indefinitely());
+                            match bake::lower_bake_res(res) {
+                                Some(next) => {
+                                    self.bake_res_override = Some(next);
+                                    self.status = format!("Not enough GPU memory for the cached {res}² maps; baking at {next}².");
+                                    self.start_bake_set(self.sets.baking, ctx);
+                                }
+                                None => {
+                                    let msg = format!("Not enough GPU memory to bake mesh maps (tried down to {res}²). The project stays open without them.");
+                                    self.fail_mcp_bake(&msg);
+                                    self.status = msg;
+                                    self.bake_next(ctx);
+                                }
+                            }
                         }
                         Err(e) => {
                             self.fail_mcp_bake(&e);
                             self.status = e;
+                            self.bake_next(ctx);
                         }
                     }
-                    self.bake_next(ctx);
                 }
-                Ok(Ok(Prepared::Scene(scene, key))) => {
+                Ok(Ok(Prepared::Scene(scene, _key))) => {
                     let res = self.set_engines().get(self.sets.baking).map_or(self.engine.res, |e| e.res);
-                    let (baker, rs, mesh, settings) = (&self.baker, &self.rs, &self.gpu_mesh, &self.bake_settings);
-                    match out_of_memory_guard(&rs.device, || baker.start(&rs.device, &rs.queue, mesh, &scene, settings, res)) {
-                        Ok(run) => {
-                            self.bake_job = Some(BakeJob::Running(run, key));
-                            ctx.request_repaint();
-                        }
-                        Err(e) => {
-                            self.fail_mcp_bake(&e);
-                            self.status = e;
-                            self.bake_job = None;
-                        }
-                    }
+                    self.launch_bake(scene, res, ctx);
                 }
                 Ok(Err(e)) => {
                     self.fail_mcp_bake(&e);
                     self.status = e;
-                    self.bake_job = None;
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => self.bake_job = Some(BakeJob::Preparing(rx)),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.fail_mcp_bake("The bake preparation stopped unexpectedly.");
-                    self.bake_job = None;
                 }
             },
-            Some(BakeJob::Running(run, key)) => {
+            BakeJob::Running { mut run, key, scene, res, reduced } => {
                 let (baker, rs) = (&self.baker, &self.rs);
-                let pumped = match out_of_memory_guard(&rs.device, || baker.pump(run, &rs.device, &rs.queue, ctx)) {
-                    Ok(maps) => maps,
-                    Err(e) => {
-                        self.fail_mcp_bake(&e);
-                        self.status = e;
-                        self.bake_job = None;
-                        return;
+                let pumped = gpu::capture(&rs.device, || baker.pump(&mut run, &rs.device, &rs.queue, ctx));
+                match pumped {
+                    Ok(Ok(None)) => {
+                        self.bake_job = Some(BakeJob::Running { run, key, scene, res, reduced });
                     }
-                };
-                if let Some(maps) = pumped {
-                    let report = run.report.clone();
-                    let matched = match report.matched_names {
-                        0 => String::new(),
-                        n => format!(", {n} parts matched by name"),
-                    };
-                    let set_res = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len()).get(self.sets.baking).map_or(self.engine.res, |e| e.res);
-                    let upscaled = if report.resolution < set_res { format!(", upscaled to {set_res}²") } else { String::new() };
-                    let set_name = match self.mesh.sets.get(self.sets.baking) {
-                        Some(s) if self.mesh.sets.len() > 1 => format!(" for {}", s.name),
-                        _ => String::new(),
-                    };
-                    self.status = format!(
-                        "Baked {} mesh maps{set_name} from {} ({} tris, {} parts{matched}{}) at {}²{upscaled}.",
-                        report.baked.count_ones(),
-                        report.source,
-                        report.triangles,
-                        report.parts,
-                        if report.used_cage { ", cage" } else { "" },
-                        report.resolution
-                    );
-                    bake_cache::store(key.clone(), &maps, report.clone(), &self.rs.device, &self.rs.queue);
-                    if let Some(e) = self.set_engine_mut(self.sets.baking) {
-                        e.set_maps(maps, report);
+                    Ok(Ok(Some(maps))) => {
+                        let report = run.report.clone();
+                        let matched = match report.matched_names {
+                            0 => String::new(),
+                            n => format!(", {n} parts matched by name"),
+                        };
+                        let set_res = texture_sets::engines(&self.engine, &self.sets, self.mesh.sets.len()).get(self.sets.baking).map_or(self.engine.res, |e| e.res);
+                        bake_cache::store(key, &maps, report.clone(), &self.rs.device, &self.rs.queue);
+                        let at_set_size = if let Some(e) = self.set_engine_mut(self.sets.baking) {
+                            e.set_maps(maps, report.clone())
+                        } else {
+                            true
+                        };
+                        let fit = if report.resolution < set_res && at_set_size {
+                            format!(", upscaled to {set_res}²")
+                        } else if report.resolution < set_res {
+                            format!(", kept at {}² because {set_res}² did not fit", report.resolution)
+                        } else {
+                            String::new()
+                        };
+                        let set_name = match self.mesh.sets.get(self.sets.baking) {
+                            Some(s) if self.mesh.sets.len() > 1 => format!(" for {}", s.name),
+                            _ => String::new(),
+                        };
+                        self.status = format!(
+                            "Baked {} mesh maps{set_name} from {} ({} tris, {} parts{matched}{}) at {}²{fit}.",
+                            report.baked.count_ones(),
+                            report.source,
+                            report.triangles,
+                            report.parts,
+                            if report.used_cage { ", cage" } else { "" },
+                            report.resolution
+                        );
+                        self.bake_next(ctx);
                     }
-                    self.bake_next(ctx);
+                    Ok(Err(msg)) | Err(msg) if gpu::allocation_failed(&msg) => {
+                        drop(run);
+                        let _ = self.rs.device.poll(wgpu::PollType::wait_indefinitely());
+                        match bake::lower_bake_res(res) {
+                            Some(next) => self.launch_bake(scene, next, ctx),
+                            None => {
+                                let msg = format!("Not enough GPU memory to bake mesh maps (tried down to {res}²). The project stays open without them.");
+                                self.fail_mcp_bake(&msg);
+                                self.status = msg;
+                                self.bake_next(ctx);
+                            }
+                        }
+                    }
+                    Ok(Err(msg)) | Err(msg) => {
+                        drop(run);
+                        self.fail_mcp_bake(&msg);
+                        self.status = msg;
+                        self.bake_next(ctx);
+                    }
                 }
             }
         }
@@ -1665,22 +1744,25 @@ impl PainterApp {
         match &self.bake_job {
             None => None,
             Some(BakeJob::Preparing(_)) => Some((0.0, "Preparing")),
-            Some(BakeJob::Running(run, _)) => Some((run.progress(), "Baking")),
+            Some(BakeJob::Running { run, .. }) => Some((run.progress(), "Baking")),
         }
     }
 
     fn load_mesh(&mut self, mesh: Mesh, ctx: &egui::Context) {
-        self.load_mesh_sized(mesh, ctx, &[]);
+        if let Err(e) = self.load_mesh_sized(mesh, ctx, &[]) {
+            self.status = e;
+        }
     }
 
     /// Loads `mesh`, making its new texture sets at `sizes` (per set, in
     /// order) instead of the default size.
-    fn load_mesh_sized(&mut self, mesh: Mesh, ctx: &egui::Context, sizes: &[u32]) {
+    fn load_mesh_sized(&mut self, mesh: Mesh, ctx: &egui::Context, sizes: &[u32]) -> Result<(), String> {
         if self.stroke.is_some() {
-            return;
+            return Ok(());
         }
         // A bake of the old mesh can't land on the new one.
         self.bake_job = None;
+        self.bake_res_override = None;
         self.end_preview(false);
         self.gpu_mesh = GpuMesh::new(&self.rs.device, &mesh);
         self.bvh = Arc::new(Bvh::from_mesh(&mesh));
@@ -1692,7 +1774,7 @@ impl PainterApp {
         };
         let old_names: Vec<String> = self.mesh.sets.iter().map(|s| s.name.clone()).collect();
         self.mesh = Arc::new(mesh);
-        self.rebuild_sets(&old_names, sizes);
+        self.rebuild_sets(&old_names, sizes)?;
         // Mesh-dependent helpers rebuild for the new mesh on demand.
         self.poly.topo = None;
         self.poly.shown = None;
@@ -1705,6 +1787,7 @@ impl PainterApp {
         if self.prefs.bake_on_load {
             self.start_bake_all(ctx);
         }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ actions
@@ -1911,13 +1994,16 @@ impl PainterApp {
                     }
                 }
                 Action::SetResolution(r) => {
-                    self.engine.set_resolution(r, &self.gpu_mesh, &mut self.undo);
-                    self.repush_graphs();
-                    if self.engine.has_bake {
-                        // Mesh maps are baked at the texture set size; refresh them.
-                        self.start_bake(ctx);
+                    if let Err(e) = self.engine.set_resolution(r, &self.gpu_mesh, &mut self.undo) {
+                        self.status = e;
+                    } else {
+                        self.repush_graphs();
+                        if self.engine.has_bake {
+                            // Mesh maps are baked at the texture set size; refresh them.
+                            self.start_bake(ctx);
+                        }
+                        self.status = format!("Texture set resolution: {r}x{r}.");
                     }
-                    self.status = format!("Texture set resolution: {r}x{r}.");
                 }
                 Action::Bake => self.start_bake(ctx),
                 Action::BakeAll => self.start_bake_all(ctx),
@@ -1953,7 +2039,9 @@ impl PainterApp {
                 }
                 self.graphs.clear(&self.rs);
                 if self.engine.res != self.prefs.default_resolution {
-                    self.engine.set_resolution(self.prefs.default_resolution, &self.gpu_mesh, &mut self.undo);
+                    if let Err(e) = self.engine.set_resolution(self.prefs.default_resolution, &self.gpu_mesh, &mut self.undo) {
+                        self.status = e;
+                    }
                 }
                 self.selected = self.engine.add_paint_layer(0, None, None, &mut self.undo);
                 self.undo.clear();

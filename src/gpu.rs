@@ -1,6 +1,7 @@
 //! Small wgpu helpers shared by the engine and the viewport renderer.
 
 use eframe::wgpu;
+use std::future::Future;
 
 /// A texture and its views. Clones share the GPU texture.
 #[derive(Clone)]
@@ -21,6 +22,24 @@ pub const LAYER_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::RENDER_ATTACHM
     .union(wgpu::TextureUsages::COPY_DST);
 
 impl Tex {
+    /// Allocates a texture, or the device's reason for refusing it.
+    ///
+    /// A refused allocation still returns a texture handle. Taking a view of
+    /// that handle is a validation error ("texture is invalid"), which is what
+    /// panics out of an unscoped `create_texture` when the GPU is out of memory.
+    /// The view is taken inside [`capture`], and the handle is dropped before
+    /// the error scope closes, so the failure stays a `Result`.
+    pub fn try_new(
+        device: &wgpu::Device,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    ) -> Result<Tex, String> {
+        capture(device, || Self::new_ms(device, label, width, height, format, usage, 1))
+    }
+
     pub fn new(
         device: &wgpu::Device,
         label: &str,
@@ -86,6 +105,47 @@ impl Tex {
     pub fn srgb(&self) -> &wgpu::TextureView {
         self.srgb_view.as_ref().unwrap_or(&self.view)
     }
+}
+
+/// Runs `f` and returns any out-of-memory, internal or validation error it
+/// caused, instead of letting wgpu panic.
+pub fn capture<T>(device: &wgpu::Device, f: impl FnOnce() -> T) -> Result<T, String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let value = f();
+    let mut parts = Vec::new();
+    for err in [pop_scope(oom.pop()), pop_scope(internal.pop())].into_iter().flatten() {
+        parts.push(err.to_string());
+    }
+    if parts.is_empty() {
+        let _ = pop_scope(validation.pop());
+        Ok(value)
+    } else {
+        // Drop while the validation scope is still up: destroying the failed
+        // resource raises the same "is invalid" error as creating its view.
+        drop(value);
+        if let Some(err) = pop_scope(validation.pop()) {
+            parts.push(err.to_string());
+        }
+        Err(parts.join("; "))
+    }
+}
+
+fn pop_scope(scope: impl Future<Output = Option<wgpu::Error>>) -> Option<wgpu::Error> {
+    let mut pop = std::pin::pin!(scope);
+    match pop.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(err) => err,
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// The device refused an allocation. wgpu reports that either as out of
+/// memory or, once a view is taken of the failed resource, as a validation
+/// error naming an invalid texture or buffer.
+pub fn allocation_failed(message: &str) -> bool {
+    let d = message.to_ascii_lowercase();
+    d.contains("out of memory") || d.contains("is invalid")
 }
 
 pub fn bytes_per_texel(format: wgpu::TextureFormat) -> u32 {
@@ -419,5 +479,18 @@ pub fn f16_to_f32(h: u16) -> f32 {
         0 => sign * man * 2f32.powi(-24),
         31 => sign * f32::INFINITY,
         _ => sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allocation_failed;
+
+    #[test]
+    fn allocation_failure_covers_the_invalid_texture_view() {
+        assert!(allocation_failed("Out of Memory"));
+        assert!(allocation_failed("Texture with 'jfa b' label is invalid"));
+        assert!(allocation_failed("Texture with 'bent normal' label is invalid"));
+        assert!(!allocation_failed("no matching overload for textureLoad"));
     }
 }

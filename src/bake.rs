@@ -23,7 +23,19 @@ use wgpu::util::DeviceExt;
 /// edge search, the ray-traced maps and their scratch copies): 4 GB at
 /// 4096², 16 GB at 8192², more than most GPUs have next to an 8K texture
 /// set. Bigger texture sets get the bake upscaled (see `Engine::set_maps`).
+/// A bake that still does not fit is retried at the next size down, to
+/// [`MIN_BAKE_RES`].
 pub const MAX_BAKE_RES: u32 = 4096;
+
+/// Smallest resolution worth baking. Below this the project stays open
+/// without mesh maps instead of retrying forever.
+pub const MIN_BAKE_RES: u32 = 512;
+
+/// The next smaller bake resolution when `res` does not fit in GPU memory.
+pub fn lower_bake_res(res: u32) -> Option<u32> {
+    let next = res / 2;
+    (next >= MIN_BAKE_RES).then_some(next)
+}
 
 /// How many packed map textures a bake makes (see `engine::MAPS`).
 pub const MAP_TEXTURES: usize = 5;
@@ -1445,7 +1457,9 @@ const DILATE: u32 = 16;
 pub struct BakeRun {
     res: u32,
     uniform: BakeUniform,
-    low: [Tex; 3],
+    /// Low-poly position in UV space. The normal and tangent targets are
+    /// dropped once the surface pass finishes; the ray tiles only read this.
+    low_pos: Tex,
     surf_pos: Tex,
     surf_nrm: Tex,
     surf_geo: Tex,
@@ -1457,9 +1471,11 @@ pub struct BakeRun {
     maps: Option<[Tex; MAP_TEXTURES]>,
     /// The custom map textures, four maps each, and each one's settings.
     custom: Vec<(Tex, [[f32; 4]; CUSTOM_PER_TEXTURE * 3])>,
-    nodes: wgpu::Buffer,
-    tri_pos: wgpu::Buffer,
-    tri_nrm: wgpu::Buffer,
+    /// Triangle BVH, dropped once the ray tiles have finished so the edge
+    /// search can allocate its full-resolution targets without it resident.
+    nodes: Option<wgpu::Buffer>,
+    tri_pos: Option<wgpu::Buffer>,
+    tri_nrm: Option<wgpu::Buffer>,
     seg_nodes: wgpu::Buffer,
     segs: wgpu::Buffer,
     /// Ray-traced tiles: x, y and the pass (0 occlusion, 1 custom maps).
@@ -1743,7 +1759,7 @@ impl GpuBaker {
             let buf = Self::uniform_buffer(device, &u);
             let mut entries = vec![
                 (0, buf.as_entire_binding()),
-                (1, v(&run.low[0])),
+                (1, v(&run.low_pos)),
                 (13, v(&run.surf_pos)),
                 (14, v(&run.surf_nrm)),
                 (28, v(&run.surf_geo)),
@@ -1768,6 +1784,9 @@ impl GpuBaker {
 
     /// Uploads the scene, renders the low-poly UV maps and runs the projection
     /// pass. Occlusion tiles are then fed by [`GpuBaker::pump`].
+    ///
+    /// Returns the device's error when a working texture does not fit, before
+    /// any later pass samples it.
     pub fn start(
         &self,
         device: &wgpu::Device,
@@ -1776,12 +1795,12 @@ impl GpuBaker {
         scene: &PreparedScene,
         settings: &BakeSettings,
         res: u32,
-    ) -> BakeRun {
+    ) -> Result<BakeRun, String> {
         let res = res.min(MAX_BAKE_RES);
         let usage = LAYER_USAGE | wgpu::TextureUsages::STORAGE_BINDING;
-        let t = |label: &str, f: F| Tex::new(device, label, res, res, f, usage);
-        let low = [t("bake pos", F::Rgba32Float), t("bake nrm", F::Rgba16Float), t("bake tan", F::Rgba32Float)];
-        let tmp = [t("bake pos 2", F::Rgba32Float), t("bake nrm 2", F::Rgba16Float), t("bake tan 2", F::Rgba32Float)];
+        let t = |label: &str, format: F| Tex::try_new(device, label, res, res, format, usage);
+        let low = [t("bake pos", F::Rgba32Float)?, t("bake nrm", F::Rgba16Float)?, t("bake tan", F::Rgba32Float)?];
+        let tmp = [t("bake pos 2", F::Rgba32Float)?, t("bake nrm 2", F::Rgba16Float)?, t("bake tan 2", F::Rgba32Float)?];
 
         let mut encoder = device.create_command_encoder(&Default::default());
         {
@@ -1836,8 +1855,8 @@ impl GpuBaker {
         }
 
         // The cage, rasterized at the low poly's UVs and dilated the same way.
-        let cage = scene.cage.as_ref().map(|corners| {
-            let set = [t("cage pos", F::Rgba32Float), t("cage nrm", F::Rgba16Float), t("cage tan", F::Rgba32Float)];
+        let cage = if let Some(corners) = scene.cage.as_ref() {
+            let set = [t("cage pos", F::Rgba32Float)?, t("cage nrm", F::Rgba16Float)?, t("cage tan", F::Rgba32Float)?];
             let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("cage"),
                 contents: bytemuck::cast_slice(corners),
@@ -1863,8 +1882,10 @@ impl GpuBaker {
                 pass.set_bind_group(0, group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            set
-        });
+            Some(set)
+        } else {
+            None
+        };
 
         let s = settings;
         let uniform = BakeUniform {
@@ -1903,19 +1924,22 @@ impl GpuBaker {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         });
 
-        let surf_pos = t("surface pos", F::Rgba32Float);
-        let surf_nrm = t("surface nrm", F::Rgba16Float);
-        let surf_geo = t("surface geo", F::Rgba32Float);
-        let surf_curv = t("surface curvature", F::Rg32Float);
+        let surf_pos = t("surface pos", F::Rgba32Float)?;
+        let surf_nrm = t("surface nrm", F::Rgba16Float)?;
+        let surf_geo = t("surface geo", F::Rgba32Float)?;
+        let surf_curv = t("surface curvature", F::Rg32Float)?;
         let maps = [
-            t("map A", MAP_FORMATS[0]),
-            t("map B", MAP_FORMATS[1]),
-            t("map C", MAP_FORMATS[2]),
-            t("map D", MAP_FORMATS[3]),
-            t("map E", MAP_FORMATS[4]),
+            t("map A", MAP_FORMATS[0])?,
+            t("map B", MAP_FORMATS[1])?,
+            t("map C", MAP_FORMATS[2])?,
+            t("map D", MAP_FORMATS[3])?,
+            t("map E", MAP_FORMATS[4])?,
         ];
         let groups = settings.baked_custom().len().div_ceil(CUSTOM_PER_TEXTURE);
-        let custom: Vec<_> = (0..groups).map(|g| (t("custom maps", CUSTOM_FORMAT), settings.custom_uniform(g))).collect();
+        let mut custom = Vec::with_capacity(groups);
+        for g in 0..groups {
+            custom.push((t("custom maps", CUSTOM_FORMAT)?, settings.custom_uniform(g)));
+        }
         let group = Self::group(
             device,
             &self.surface.1,
@@ -1950,6 +1974,19 @@ impl GpuBaker {
         });
         encoder.copy_buffer_to_buffer(&counters, 0, &readback, 0, 12);
         queue.submit([encoder.finish()]);
+        // The raster no longer needs its scratch targets, the cage, or the
+        // low-poly normal and tangent. Wait for that pass so the memory is
+        // actually free before the occlusion targets are allocated.
+        drop(forward);
+        drop(backward);
+        drop(group);
+        drop(cage);
+        drop(tmp);
+        drop(parts);
+        drop(ids);
+        let [low_pos, nrm, tan] = low;
+        drop((nrm, tan));
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
         let report = Arc::new(BakeReport {
             source: scene.source.clone(),
@@ -2003,21 +2040,21 @@ impl GpuBaker {
                 }
             }
         }
-        BakeRun {
+        Ok(BakeRun {
             res,
             uniform,
-            low,
+            low_pos,
             surf_pos,
             surf_nrm,
             surf_geo,
             surf_curv,
-            occ: t("occlusion", F::Rgba8Unorm),
-            bent: t("bent normal", F::Rgba8Unorm),
+            occ: t("occlusion", F::Rgba8Unorm)?,
+            bent: t("bent normal", F::Rgba8Unorm)?,
             maps: Some(maps),
             custom,
-            nodes,
-            tri_pos,
-            tri_nrm,
+            nodes: Some(nodes),
+            tri_pos: Some(tri_pos),
+            tri_nrm: Some(tri_nrm),
             seg_nodes,
             segs,
             tiles,
@@ -2025,19 +2062,21 @@ impl GpuBaker {
             done_tiles: Arc::new(AtomicUsize::new(0)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             report,
-        }
+        })
     }
 
     /// Feeds occlusion tiles to the GPU, keeping a bounded number in flight.
-    /// Once every tile is submitted, encodes the final passes and returns the
-    /// maps; the GPU runs them in submission order after the last tile.
+    /// Once every tile has finished, drops the triangle BVH and encodes the
+    /// final passes. The GPU runs them in submission order after the last tile.
+    ///
+    /// An allocation error is returned before those passes are submitted.
     pub fn pump(
         &self,
         run: &mut BakeRun,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         ctx: &egui::Context,
-    ) -> Option<BakedMaps> {
+    ) -> Result<Option<BakedMaps>, String> {
         while run.next_tile < run.tiles.len() && run.in_flight.load(Ordering::Acquire) < MAX_IN_FLIGHT {
             let [x, y, pass] = run.tiles[run.next_tile];
             run.next_tile += 1;
@@ -2051,10 +2090,10 @@ impl GpuBaker {
                     &self.occlusion.1,
                     vec![
                         (0, ubuf.as_entire_binding()),
-                        (1, v(&run.low[0])),
-                        (4, run.nodes.as_entire_binding()),
-                        (5, run.tri_pos.as_entire_binding()),
-                        (6, run.tri_nrm.as_entire_binding()),
+                        (1, v(&run.low_pos)),
+                        (4, run.nodes.as_ref().unwrap().as_entire_binding()),
+                        (5, run.tri_pos.as_ref().unwrap().as_entire_binding()),
+                        (6, run.tri_nrm.as_ref().unwrap().as_entire_binding()),
                         (13, v(&run.surf_pos)),
                         (14, v(&run.surf_nrm)),
                         (15, v(&run.occ)),
@@ -2073,10 +2112,10 @@ impl GpuBaker {
                     &self.custom.1,
                     vec![
                         (0, ubuf.as_entire_binding()),
-                        (1, v(&run.low[0])),
-                        (4, run.nodes.as_entire_binding()),
-                        (5, run.tri_pos.as_entire_binding()),
-                        (6, run.tri_nrm.as_entire_binding()),
+                        (1, v(&run.low_pos)),
+                        (4, run.nodes.as_ref().unwrap().as_entire_binding()),
+                        (5, run.tri_pos.as_ref().unwrap().as_entire_binding()),
+                        (6, run.tri_nrm.as_ref().unwrap().as_entire_binding()),
                         (13, v(&run.surf_pos)),
                         (14, v(&run.surf_nrm)),
                         (28, v(&run.surf_geo)),
@@ -2097,20 +2136,30 @@ impl GpuBaker {
             Self::poll_until_done(device);
         }
         if run.next_tile < run.tiles.len() || run.maps.is_none() {
-            return None;
+            return Ok(None);
         }
+        // Tiles are queued ahead of the GPU. The post pass has to wait until
+        // they finish: their BVH is still in use, and it is the allocation
+        // that crowds out the edge-search textures on a heavy mesh.
+        if run.in_flight.load(Ordering::Acquire) > 0 {
+            return Ok(None);
+        }
+        drop(run.nodes.take());
+        drop(run.tri_pos.take());
+        drop(run.tri_nrm.take());
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
-        // Every occlusion tile is queued: curvature, edge distance and packing.
+        // Curvature, edge distance and packing.
         let res = run.res;
         let usage = LAYER_USAGE | wgpu::TextureUsages::STORAGE_BINDING;
-        let curv = Tex::new(device, "curvature", res, res, F::Rgba16Float, usage);
+        let curv = Tex::try_new(device, "curvature", res, res, F::Rgba16Float, usage)?;
         let jfa = [
-            Tex::new(device, "jfa a", res, res, F::Rgba32Float, usage),
-            Tex::new(device, "jfa b", res, res, F::Rgba32Float, usage),
+            Tex::try_new(device, "jfa a", res, res, F::Rgba32Float, usage)?,
+            Tex::try_new(device, "jfa b", res, res, F::Rgba32Float, usage)?,
         ];
         let ubuf = Self::uniform_buffer(device, &run.uniform);
         let mut encoder = device.create_command_encoder(&Default::default());
-        let edges = Tex::new(device, "edge distance", res, res, F::Rgba16Float, usage);
+        let edges = Tex::try_new(device, "edge distance", res, res, F::Rgba16Float, usage)?;
         // Curvature seeds the edge search, so the three are baked together.
         let baked = run.uniform.g[1] as u32;
         if baked & 0b110_0010 != 0 {
@@ -2119,7 +2168,7 @@ impl GpuBaker {
             &self.curvature.1,
             vec![
                 (0, ubuf.as_entire_binding()),
-                (1, v(&run.low[0])),
+                (1, v(&run.low_pos)),
                 (13, v(&run.surf_pos)),
                 (14, v(&run.surf_nrm)),
                 (17, v(&curv)),
@@ -2129,14 +2178,14 @@ impl GpuBaker {
         Self::dispatch(&mut encoder, &self.curvature.0, &g, res, res);
         // Triangle-scale smoothing (see `cs_curv_smooth`), before edges are
         // seeded from it. An even pass count ends back in `curv`.
-        let curv_scratch = Tex::new(device, "curvature 2", res, res, F::Rgba16Float, usage);
+        let curv_scratch = Tex::try_new(device, "curvature 2", res, res, F::Rgba16Float, usage)?;
         Self::smooth_passes(device, &mut encoder, &self.curv_smooth, run, &[(&curv, &curv_scratch, 18, 17)], 2);
         let g = Self::group(
             device,
             &self.jfa_init.1,
             vec![
                 (0, ubuf.as_entire_binding()),
-                (1, v(&run.low[0])),
+                (1, v(&run.low_pos)),
                 (13, v(&run.surf_pos)),
                 (18, v(&curv)),
                 (19, v(&jfa[0])),
@@ -2188,8 +2237,8 @@ impl GpuBaker {
         // softens contact shadows and cavity.
         let passes = denoise_passes(run.uniform.b[0] as u32);
         let scratch = [
-            Tex::new(device, "occlusion 2", res, res, F::Rgba8Unorm, usage),
-            Tex::new(device, "bent normal 2", res, res, F::Rgba8Unorm, usage),
+            Tex::try_new(device, "occlusion 2", res, res, F::Rgba8Unorm, usage)?,
+            Tex::try_new(device, "bent normal 2", res, res, F::Rgba8Unorm, usage)?,
         ];
         for i in 0..passes {
             let (src_occ, src_bent, dst_occ, dst_bent) = if i % 2 == 0 {
@@ -2205,7 +2254,7 @@ impl GpuBaker {
                 &self.denoise.1,
                 vec![
                     (0, step_buf.as_entire_binding()),
-                    (1, v(&run.low[0])),
+                    (1, v(&run.low_pos)),
                     (13, v(&run.surf_pos)),
                     (14, v(&run.surf_nrm)),
                     (21, v(src_occ)),
@@ -2230,7 +2279,7 @@ impl GpuBaker {
             6,
         );
         if !run.custom.is_empty() {
-            let scratch = Tex::new(device, "custom maps 2", res, res, CUSTOM_FORMAT, usage);
+            let scratch = Tex::try_new(device, "custom maps 2", res, res, CUSTOM_FORMAT, usage)?;
             for (target, _) in &run.custom {
                 Self::smooth_passes(device, &mut encoder, &self.cust_smooth, run, &[(target, &scratch, 37, 36)], 4);
             }
@@ -2242,7 +2291,7 @@ impl GpuBaker {
             &self.pack.1,
             vec![
                 (0, ubuf.as_entire_binding()),
-                (1, v(&run.low[0])),
+                (1, v(&run.low_pos)),
                 (13, v(&run.surf_pos)),
                 (14, v(&run.surf_nrm)),
                 (18, v(&curv)),
@@ -2264,7 +2313,7 @@ impl GpuBaker {
             ctx.request_repaint();
         });
         Self::poll_until_done(device);
-        Some(BakedMaps { maps, custom: run.custom.iter().map(|(t, _)| t.clone()).collect() })
+        Ok(Some(BakedMaps { maps, custom: run.custom.iter().map(|(t, _)| t.clone()).collect() }))
     }
 
     /// wgpu runs completion callbacks only while the device is polled, which
@@ -2287,6 +2336,14 @@ pub(crate) mod tests {
     //! `MP_BAKE_TEST="a.fbx;b.obj"`.
 
     use super::*;
+
+    #[test]
+    fn bake_resolution_steps_down_until_the_minimum() {
+        assert_eq!(lower_bake_res(4096), Some(2048));
+        assert_eq!(lower_bake_res(1024), Some(512));
+        assert_eq!(lower_bake_res(512), None);
+        assert_eq!(lower_bake_res(600), None);
+    }
     use crate::engine::{MAPS, MapKind};
     use crate::gpu::{GpuMesh, f16_to_f32, read_texture};
     use crate::mesh::Primitive;
@@ -2502,9 +2559,9 @@ pub(crate) mod tests {
         let scene = prepare(mesh, settings, 0).expect("bake source");
         let baker = GpuBaker::new(device);
         let ctx = egui::Context::default();
-        let mut run = baker.start(device, queue, gpu_mesh, &scene, settings, res);
+        let mut run = baker.start(device, queue, gpu_mesh, &scene, settings, res).expect("bake");
         let maps = loop {
-            if let Some(maps) = baker.pump(&mut run, device, queue, &ctx) {
+            if let Some(maps) = baker.pump(&mut run, device, queue, &ctx).expect("bake") {
                 break maps;
             }
             // Blocks until the in-flight tiles finish, which frees slots for the next ones.
@@ -2521,7 +2578,7 @@ pub(crate) mod tests {
             r.seconds().unwrap_or(0.0),
             r.missed_percent().unwrap_or(0.0)
         );
-        let [low_pos, _, _] = run.low;
+        let low_pos = run.low_pos.clone();
         (maps, run.report, low_pos)
     }
 
@@ -2715,9 +2772,9 @@ pub(crate) mod tests {
         let scene = prepare(mesh, settings, 0).expect("bake source");
         let baker = GpuBaker::new(device);
         let ctx = egui::Context::default();
-        let mut run = baker.start(device, queue, &gpu_mesh, &scene, settings, res);
+        let mut run = baker.start(device, queue, &gpu_mesh, &scene, settings, res).expect("bake");
         let maps = loop {
-            if let Some(maps) = baker.pump(&mut run, device, queue, &ctx) {
+            if let Some(maps) = baker.pump(&mut run, device, queue, &ctx).expect("bake") {
                 break maps;
             }
             device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
@@ -2726,7 +2783,7 @@ pub(crate) mod tests {
         let f32s = |t: &Tex| -> Vec<[f32; 4]> {
             read_texture(device, queue, t).chunks_exact(16).map(|b| [0, 1, 2, 3].map(|k| f32::from_le_bytes([b[k * 4], b[k * 4 + 1], b[k * 4 + 2], b[k * 4 + 3]]))).collect()
         };
-        let low = f32s(&run.low[0]);
+        let low = f32s(&run.low_pos);
         let nrm: Vec<Vec3> = read_texture(device, queue, &run.surf_nrm)
             .chunks_exact(8)
             .map(|b| Vec3::new(f16_to_f32(u16::from_le_bytes([b[0], b[1]])), f16_to_f32(u16::from_le_bytes([b[2], b[3]])), f16_to_f32(u16::from_le_bytes([b[4], b[5]]))))

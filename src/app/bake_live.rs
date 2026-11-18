@@ -183,7 +183,9 @@ impl PainterApp {
         if let Some(saved) = self.bake_preview.saved.take() {
             if restore {
                 match saved {
-                    Some((maps, report)) => self.engine.set_maps(maps, report),
+                    Some((maps, report)) => {
+                        self.engine.set_maps(maps, report);
+                    }
                     None => self.engine.clear_maps(),
                 }
             }
@@ -225,15 +227,26 @@ impl PainterApp {
         if self.bake_preview.run.as_ref().is_some_and(|(k, res, _)| *k != key && *res > quick) {
             self.bake_preview.run = None;
         }
+        let mut preview_failed: Option<(String, String)> = None;
         if let Some((rkey, rres, run)) = &mut self.bake_preview.run {
-            let Some(maps) = self.baker.pump(run, &self.rs.device, &self.rs.queue, ctx) else { return };
-            let (shown, report) = ((rkey.clone(), *rres), run.report.clone());
-            if self.bake_preview.saved.is_none() {
-                self.bake_preview.saved = Some(self.engine.current_maps());
+            match self.baker.pump(run, &self.rs.device, &self.rs.queue, ctx) {
+                Ok(None) => return,
+                Err(e) => preview_failed = Some((rkey.clone(), e)),
+                Ok(Some(maps)) => {
+                    let (shown, report) = ((rkey.clone(), *rres), run.report.clone());
+                    if self.bake_preview.saved.is_none() {
+                        self.bake_preview.saved = Some(self.engine.current_maps());
+                    }
+                    self.engine.set_maps(maps, report);
+                    self.bake_preview.shown = Some(shown);
+                    self.bake_preview.run = None;
+                }
             }
-            self.engine.set_maps(maps, report);
-            self.bake_preview.shown = Some(shown);
+        }
+        if let Some(failed) = preview_failed {
+            self.bake_preview.failed = Some(failed);
             self.bake_preview.run = None;
+            return;
         }
 
         // A quick preview of new settings, then sharper ones of the same.
@@ -251,7 +264,13 @@ impl PainterApp {
         let pkey = self.bake_key(true);
         match &self.bake_preview.scene {
             Some((k, scene)) if *k == pkey => {
-                let run = self.baker.start(&self.rs.device, &self.rs.queue, &self.gpu_mesh, scene, &self.bake_settings.preview(), res);
+                let run = match self.baker.start(&self.rs.device, &self.rs.queue, &self.gpu_mesh, scene, &self.bake_settings.preview(), res) {
+                    Ok(run) => run,
+                    Err(e) => {
+                        self.bake_preview.failed = Some((key, e));
+                        return;
+                    }
+                };
                 self.bake_preview.run = Some((key, res, run));
                 self.bake_preview.starts += 1;
                 ctx.request_repaint();

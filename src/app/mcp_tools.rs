@@ -210,7 +210,7 @@ impl PainterApp {
                     if !super::RESOLUTIONS.contains(&r) {
                         return Err(format!("resolution must be one of {:?}", super::RESOLUTIONS));
                     }
-                    self.engine.set_resolution(r, &self.gpu_mesh, &mut self.undo);
+                    self.engine.set_resolution(r, &self.gpu_mesh, &mut self.undo)?;
                 }
                 self.start_bake(ctx);
                 Reply::AfterBake

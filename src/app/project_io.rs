@@ -702,7 +702,7 @@ impl PainterApp {
         // Switch mesh first, then each set's size: layers are created at it.
         self.bake_settings = bs;
         let sizes: Vec<u32> = set_values.iter().map(|sv| sv["resolution"].as_u64().unwrap_or(2048) as u32).collect();
-        self.load_mesh_sized(mesh, ctx, &sizes);
+        self.load_mesh_sized(mesh, ctx, &sizes)?;
         self.graphs.clear(&self.rs);
         for gv in manifest["graphs"].as_array().into_iter().flatten() {
             let Some(id) = gv["id"].as_u64() else { continue };
@@ -720,7 +720,7 @@ impl PainterApp {
             }
             let res = sv["resolution"].as_u64().unwrap_or(2048) as u32;
             if res != self.engine.res {
-                self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo);
+                self.engine.set_resolution(res, &self.gpu_mesh, &mut self.undo)?;
             }
             let mut layers = Vec::new();
             for lv in sv["layers_bottom_to_top"].as_array().ok_or_else(bad)? {
